@@ -16,11 +16,11 @@ video as VLC's primary input and attaches the audio with `--input-slave`.
 
 ### Stream resolution and playback
 
-![yt-vlc media information and VLC handoff](docs/screenshots/playback.svg)
+![yt-vlc media information and VLC handoff](docs/screenshots/playback.png)
 
 ### First-run dependency setup
 
-![yt-vlc prerequisite download progress](docs/screenshots/first-run-setup.svg)
+![yt-vlc prerequisite download progress](docs/screenshots/first-run-setup.png)
 
 ## Features
 

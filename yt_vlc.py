@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,8 @@ BANNER = r"""
 """
 
 _ui_lock = threading.Lock()
+_live_length = 0
+_ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def supports_color(stream: object = sys.stdout) -> bool:
@@ -76,26 +79,34 @@ def ui(message: str = "", *, end: str = "\n") -> None:
 
 def clear_live() -> None:
     """Erase the current terminal line using portable carriage-return behavior."""
+    global _live_length
     if not sys.stderr.isatty():
         return
-    width = shutil.get_terminal_size(fallback=(88, 24)).columns
-    with _ui_lock:
-        print("\r" + " " * max(0, width - 1) + "\r", end="", file=sys.stderr, flush=True)
-
-
-def live(message: str) -> None:
-    """Replace the current status line without adding to terminal history."""
-    if not sys.stderr.isatty():
-        ui(message)
-        return
-    width = shutil.get_terminal_size(fallback=(88, 24)).columns
     with _ui_lock:
         print(
-            "\r" + " " * max(0, width - 1) + "\r" + message,
+            "\r" + " " * _live_length + "\r",
             end="",
             file=sys.stderr,
             flush=True,
         )
+        _live_length = 0
+
+
+def live(message: str) -> None:
+    """Replace the current status line without adding to terminal history."""
+    global _live_length
+    if not sys.stderr.isatty():
+        ui(message)
+        return
+    visible_length = len(_ansi_escape.sub("", message))
+    with _ui_lock:
+        print(
+            "\r" + message + " " * max(0, _live_length - visible_length),
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        _live_length = visible_length
 
 
 def finish_live(message: str) -> None:
