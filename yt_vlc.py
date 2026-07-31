@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,6 +26,21 @@ YT_DLP_URL = (
 )
 VLC_URL = "https://get.videolan.org/vlc/3.0.23/win64/vlc-3.0.23-win64.zip"
 CHUNK_SIZE = 256 * 1024
+METADATA_PREFIX = "__YTVLC_META__"
+METADATA_FIELDS = (
+    "title",
+    "uploader",
+    "channel",
+    "duration",
+    "duration_string",
+    "resolution",
+    "format_id",
+    "ext",
+    "fps",
+    "vcodec",
+    "acodec",
+    "filesize_approx",
+)
 
 BANNER = r"""
  __   _______       __     ___     ____
@@ -65,6 +82,44 @@ def status(label: str, message: str, color: str = "36") -> None:
     ui(f"{marker} {message}")
 
 
+class BrailleSpinner:
+    """Animate a status line without delaying the work running on the main thread."""
+
+    frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        self.started = 0.0
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.enabled = sys.stderr.isatty()
+
+    def __enter__(self) -> BrailleSpinner:
+        if self.enabled:
+            self.started = time.monotonic()
+            self.thread = threading.Thread(target=self._animate, daemon=True)
+            self.thread.start()
+        return self
+
+    def _animate(self) -> None:
+        frame = 0
+        while not self.stop_event.is_set():
+            glyph = colored(self.frames[frame % len(self.frames)], "1;35", sys.stderr)
+            elapsed = time.monotonic() - self.started
+            ui(f"\r{glyph} {self.message} {elapsed:4.1f}s", end="")
+            frame += 1
+            self.stop_event.wait(0.08)
+
+    def __exit__(self, *_: object) -> None:
+        if not self.enabled:
+            return
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join()
+        width = shutil.get_terminal_size(fallback=(88, 24)).columns
+        ui("\r" + " " * max(0, width - 1) + "\r", end="")
+
+
 def human_size(value: int) -> str:
     size = float(value)
     for unit in ("B", "KiB", "MiB", "GiB"):
@@ -72,6 +127,93 @@ def human_size(value: int) -> str:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} GiB"
+
+
+def human_duration(value: object) -> str:
+    if not isinstance(value, (int, float)) or value < 0:
+        return ""
+    total_seconds = round(value)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02}:{seconds:02}"
+    return f"{minutes}:{seconds:02}"
+
+
+def metadata_template() -> str:
+    values = "\t".join(f"%({field})j" for field in METADATA_FIELDS)
+    return f"video:{METADATA_PREFIX}{values}"
+
+
+def parse_metadata(line: str) -> dict[str, object]:
+    values = line.removeprefix(METADATA_PREFIX).split("\t")
+    if len(values) != len(METADATA_FIELDS):
+        return {}
+
+    decoded: list[object] = []
+    for value in values:
+        try:
+            decoded.append(json.loads(value))
+        except json.JSONDecodeError:
+            decoded.append(value)
+    return dict(zip(METADATA_FIELDS, decoded))
+
+
+def usable_metadata(value: object) -> bool:
+    return value not in (None, "", "NA", "none", "None")
+
+
+def show_media_info(info: dict[str, object]) -> None:
+    """Render a compact media summary beneath the resolver result."""
+    if not info:
+        return
+
+    title = info.get("title")
+    if usable_metadata(title):
+        status("MEDIA", str(title), "35")
+
+    creator = info.get("uploader")
+    if not usable_metadata(creator):
+        creator = info.get("channel")
+
+    resolution = info.get("resolution")
+    fps = info.get("fps")
+    quality = str(resolution) if usable_metadata(resolution) else ""
+    if usable_metadata(fps):
+        quality += f" @ {fps} fps" if quality else f"{fps} fps"
+
+    format_parts = [
+        str(info[field])
+        for field in ("format_id", "ext")
+        if usable_metadata(info.get(field))
+    ]
+    codecs = [
+        str(info[field])
+        for field in ("vcodec", "acodec")
+        if usable_metadata(info.get(field)) and info.get(field) != "none"
+    ]
+
+    rows: list[tuple[str, str]] = []
+    if usable_metadata(creator):
+        rows.append(("creator", str(creator)))
+    duration = human_duration(info.get("duration"))
+    if not duration and usable_metadata(info.get("duration_string")):
+        duration = str(info["duration_string"])
+    if duration:
+        rows.append(("duration", duration))
+    if quality:
+        rows.append(("quality", quality))
+    if format_parts:
+        rows.append(("format", " • ".join(format_parts)))
+    if codecs:
+        rows.append(("codecs", " + ".join(codecs)))
+    size = info.get("filesize_approx")
+    if isinstance(size, (int, float)) and size > 0:
+        rows.append(("size", f"~{human_size(int(size))}"))
+
+    for label, value in rows:
+        label_text = colored(label, "1;33", sys.stderr) + " " * (8 - len(label))
+        ui(f"        {label_text} {value}")
 
 
 def progress_line(name: str, downloaded: int, total: int | None) -> str:
@@ -267,23 +409,37 @@ def find_program(
     )
 
 
-def resolve_streams(yt_dlp: str, page_url: str, format_selector: str) -> list[str]:
+def resolve_streams(
+    yt_dlp: str, page_url: str, format_selector: str
+) -> tuple[list[str], dict[str, object]]:
     command = [
         yt_dlp,
         "--no-playlist",
         "--no-warnings",
         "-f",
         format_selector,
+        "--print",
+        metadata_template(),
         "-g",
         page_url,
     ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    with BrailleSpinner("Resolving media information"):
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
 
     if result.returncode:
         message = result.stderr.strip() or "yt-dlp could not resolve the URL"
         raise RuntimeError(message)
 
-    streams = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    streams: list[str] = []
+    metadata: dict[str, object] = {}
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(METADATA_PREFIX):
+            metadata = parse_metadata(line)
+        else:
+            streams.append(line)
     if not streams:
         raise RuntimeError("yt-dlp returned no stream URLs")
     if len(streams) > 2:
@@ -291,11 +447,13 @@ def resolve_streams(yt_dlp: str, page_url: str, format_selector: str) -> list[st
             f"yt-dlp returned {len(streams)} URLs; expected one combined stream or "
             "separate video and audio streams"
         )
-    return streams
+    return streams, metadata
 
 
 def vlc_command(vlc: str, streams: list[str]) -> list[str]:
-    command = [vlc, streams[0]]
+    # A fresh VLC process is required for reliable --input-slave handling.
+    # VLC's single-instance handoff can silently discard the companion audio URL.
+    command = [vlc, "--no-one-instance", streams[0]]
     if len(streams) == 2:
         command.append(f"--input-slave={streams[1]}")
     return command
@@ -344,7 +502,7 @@ def main() -> int:
 
         status(f"2/{stage_count}", "Resolving network streams")
         started = time.monotonic()
-        streams = resolve_streams(yt_dlp, page_url, args.format)
+        streams, media_info = resolve_streams(yt_dlp, page_url, args.format)
         elapsed = time.monotonic() - started
         stream_description = (
             "separate video + audio" if len(streams) == 2 else "combined video/audio"
@@ -355,6 +513,7 @@ def main() -> int:
             f"({stream_description}) in {elapsed:.1f}s",
             "32",
         )
+        show_media_info(media_info)
 
         if args.print_only:
             print("\n".join(streams))
