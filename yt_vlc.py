@@ -50,6 +50,8 @@ BANNER = r"""
    |_|   |_|           \_/  |_____\____|
 """
 
+_ui_lock = threading.Lock()
+
 
 def supports_color(stream: object = sys.stdout) -> bool:
     """Return whether a stream supports interactive ANSI styling."""
@@ -68,7 +70,38 @@ def colored(text: str, code: str, stream: object = sys.stdout) -> str:
 
 def ui(message: str = "", *, end: str = "\n") -> None:
     """Write user-interface output to stderr, preserving stdout for stream URLs."""
-    print(message, end=end, file=sys.stderr, flush=True)
+    with _ui_lock:
+        print(message, end=end, file=sys.stderr, flush=True)
+
+
+def clear_live() -> None:
+    """Erase the current terminal line using portable carriage-return behavior."""
+    if not sys.stderr.isatty():
+        return
+    width = shutil.get_terminal_size(fallback=(88, 24)).columns
+    with _ui_lock:
+        print("\r" + " " * max(0, width - 1) + "\r", end="", file=sys.stderr, flush=True)
+
+
+def live(message: str) -> None:
+    """Replace the current status line without adding to terminal history."""
+    if not sys.stderr.isatty():
+        ui(message)
+        return
+    width = shutil.get_terminal_size(fallback=(88, 24)).columns
+    with _ui_lock:
+        print(
+            "\r" + " " * max(0, width - 1) + "\r" + message,
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def finish_live(message: str) -> None:
+    """Replace the live line and make its final state persistent."""
+    clear_live()
+    ui(message)
 
 
 def print_banner() -> None:
@@ -78,8 +111,14 @@ def print_banner() -> None:
 
 
 def status(label: str, message: str, color: str = "36") -> None:
+    clear_live()
     marker = colored(f"[{label}]", f"1;{color}", sys.stderr)
     ui(f"{marker} {message}")
+
+
+def live_status(label: str, message: str, color: str = "36") -> None:
+    marker = colored(f"[{label}]", f"1;{color}", sys.stderr)
+    live(f"{marker} {message}")
 
 
 class BrailleSpinner:
@@ -106,7 +145,7 @@ class BrailleSpinner:
         while not self.stop_event.is_set():
             glyph = colored(self.frames[frame % len(self.frames)], "1;35", sys.stderr)
             elapsed = time.monotonic() - self.started
-            ui(f"\r{glyph} {self.message} {elapsed:4.1f}s", end="")
+            live(f"{glyph} {self.message} {elapsed:4.1f}s")
             frame += 1
             self.stop_event.wait(0.08)
 
@@ -116,8 +155,7 @@ class BrailleSpinner:
         self.stop_event.set()
         if self.thread:
             self.thread.join()
-        width = shutil.get_terminal_size(fallback=(88, 24)).columns
-        ui("\r" + " " * max(0, width - 1) + "\r", end="")
+        clear_live()
 
 
 def human_size(value: int) -> str:
@@ -293,17 +331,11 @@ def download(url: str, destination: Path) -> None:
                     output.write(chunk)
                     downloaded += len(chunk)
                     if interactive:
-                        ui(progress_line(destination.name, downloaded, total), end="\r")
+                        live(progress_line(destination.name, downloaded, total))
             if interactive:
-                ui(
-                    " "
-                    * max(
-                        0,
-                        shutil.get_terminal_size(fallback=(88, 24)).columns - 1,
-                    ),
-                    end="\r",
-                )
-            ui(progress_line(destination.name, downloaded, total))
+                finish_live(progress_line(destination.name, downloaded, total))
+            else:
+                ui(progress_line(destination.name, downloaded, total))
         temporary.replace(destination)
         status("OK", f"Downloaded {destination.name} ({human_size(downloaded)})", "32")
     except Exception:
@@ -363,17 +395,17 @@ def ensure_bundled_tools() -> tuple[Path, Path]:
     if not yt_dlp.is_file():
         download(YT_DLP_URL, yt_dlp)
     else:
-        status("OK", "yt-dlp is ready", "32")
+        live_status("OK", "yt-dlp is ready", "32")
 
     if not vlc.is_file():
         with tempfile.TemporaryDirectory(prefix="yt-vlc-") as temporary_dir:
             archive = Path(temporary_dir) / "vlc.zip"
             download(VLC_URL, archive)
-            status("...", "Extracting portable VLC", "33")
+            live_status("...", "Extracting portable VLC", "33")
             extract_portable_vlc(archive, vlc_directory)
-            status("OK", "Portable VLC extracted", "32")
+            live_status("OK", "Portable VLC extracted", "32")
     else:
-        status("OK", "VLC is ready", "32")
+        live_status("OK", "VLC is ready", "32")
 
     return yt_dlp, vlc
 
@@ -496,18 +528,18 @@ def main() -> int:
             raise RuntimeError("No media URL was provided")
 
         stage_count = 2 if args.print_only else 3
-        status(f"1/{stage_count}", "Checking prerequisites")
+        live_status(f"1/{stage_count}", "Checking prerequisites")
         bundled_yt_dlp, bundled_vlc = ensure_bundled_tools()
         yt_dlp = find_program("yt-dlp", args.yt_dlp, bundled_yt_dlp)
 
-        status(f"2/{stage_count}", "Resolving network streams")
+        live_status(f"2/{stage_count}", "Resolving network streams")
         started = time.monotonic()
         streams, media_info = resolve_streams(yt_dlp, page_url, args.format)
         elapsed = time.monotonic() - started
         stream_description = (
             "separate video + audio" if len(streams) == 2 else "combined video/audio"
         )
-        status(
+        live_status(
             "OK",
             f"Resolved {len(streams)} stream{'s' if len(streams) != 1 else ''} "
             f"({stream_description}) in {elapsed:.1f}s",
@@ -516,11 +548,12 @@ def main() -> int:
         show_media_info(media_info)
 
         if args.print_only:
+            clear_live()
             print("\n".join(streams))
             return 0
 
         vlc = find_program("vlc", args.vlc, bundled_vlc)
-        status("3/3", f"Opening {stream_description} in VLC")
+        live_status("3/3", f"Opening {stream_description} in VLC")
         subprocess.Popen(vlc_command(vlc, streams), cwd=Path(vlc).parent)
         status("OK", "Stream handed off to VLC — enjoy", "32")
         return 0

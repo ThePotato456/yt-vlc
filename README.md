@@ -12,12 +12,22 @@ stream URLs directly to VLC.
 When a site provides separate video and audio streams, the script opens the
 video as VLC's primary input and attaches the audio with `--input-slave`.
 
+## Screenshots
+
+### Stream resolution and playback
+
+![yt-vlc media information and VLC handoff](docs/screenshots/playback.svg)
+
+### First-run dependency setup
+
+![yt-vlc prerequisite download progress](docs/screenshots/first-run-setup.svg)
+
 ## Features
 
 - Plays supported media pages directly in VLC
 - Handles combined streams and separate video/audio streams
 - Opens each stream in a fresh VLC instance so existing playback is not interrupted
-- Provides a polished, colorized terminal interface with staged status updates
+- Provides a colorized, in-place status line that keeps terminal output compact
 - Displays live progress bars while downloading prerequisites
 - Animates media resolution with a Braille spinner
 - Shows title, creator, duration, quality, codecs, and estimated media size
