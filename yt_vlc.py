@@ -494,11 +494,16 @@ def resolve_streams(
 
 
 def vlc_command(vlc: str, streams: list[str]) -> list[str]:
-    # A fresh VLC process is required for reliable --input-slave handling.
-    # VLC's single-instance handoff can silently discard the companion audio URL.
-    command = [vlc, "--no-one-instance", streams[0]]
+    # Reuse the active VLC instance and replace its current item. The audio slave
+    # is item-specific so it survives VLC's inter-process playlist handoff.
+    command = [
+        vlc,
+        "--one-instance",
+        "--no-playlist-enqueue",
+        streams[0],
+    ]
     if len(streams) == 2:
-        command.append(f"--input-slave={streams[1]}")
+        command.append(f":input-slave={streams[1]}")
     return command
 
 

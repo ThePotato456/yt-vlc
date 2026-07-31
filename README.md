@@ -26,7 +26,7 @@ video as VLC's primary input and attaches the audio with `--input-slave`.
 
 - Plays supported media pages directly in VLC
 - Handles combined streams and separate video/audio streams
-- Opens each stream in a fresh VLC instance so existing playback is not interrupted
+- Replaces the currently playing VLC item when the script is run again
 - Provides a colorized, in-place status line that keeps terminal output compact
 - Displays live progress bars while downloading prerequisites
 - Animates media resolution with a Braille spinner
@@ -158,10 +158,11 @@ python .\yt_vlc.py `
 1. The script ensures its pinned tools are available under `./bin`.
 2. yt-dlp resolves the supplied page using `--no-playlist`, the selected
    format, and `-g`.
-3. A single URL is opened directly in VLC.
+3. A single URL is opened directly in VLC. If VLC is already running, its
+   current item is replaced instead of opening another player window.
 4. If two URLs are returned, the first is treated as video and the second as
-   audio and attached through VLC's `--input-slave` option.
+   audio and attached through VLC's item-specific `:input-slave` option.
 
-The script passes `--no-one-instance` to VLC. This avoids a VLC handoff issue
-that can silently discard the companion audio stream when another VLC window is
-already open; existing VLC playback is left untouched.
+The script passes `--one-instance` and `--no-playlist-enqueue` to VLC. This
+makes repeat runs behave like media requests: the new item starts immediately
+in the existing player rather than being queued or opened in another window.
