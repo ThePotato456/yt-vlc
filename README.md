@@ -93,8 +93,9 @@ playback queue. Run the bot on the same logged-in Windows session as VLC.
 1. Create an application and bot in the
    [Discord Developer Portal](https://discord.com/developers/applications).
 2. On the bot settings page, enable **Message Content Intent**.
-3. Invite the bot with **View Channels**, **Send Messages**, and
-   **Read Message History** permissions.
+3. Invite the bot with **View Channels**, **Send Messages**,
+   **Read Message History**, and **Manage Messages** permissions. Manage
+   Messages lets it remove sensitive debrid requests posted publicly.
 4. Install the Python dependency and create the local configuration:
 
    ```powershell
@@ -102,8 +103,10 @@ playback queue. Run the bot on the same logged-in Windows session as VLC.
    Copy-Item .\.env.example .\.env
    ```
 
-5. Add the bot token to `.env`. Set `DISCORD_GUILD_ID` for the intended server,
-   and optionally set `DISCORD_REQUEST_CHANNEL_ID` for one request channel.
+5. Add the bot token to `.env`. If the bot belongs to exactly one server,
+   owner-only DM controls target it automatically. Set `DISCORD_GUILD_ID` when
+   the bot belongs to multiple servers. Optionally set
+   `DISCORD_REQUEST_CHANNEL_ID` for one server request channel.
 6. Start the bot:
 
    ```powershell
@@ -126,6 +129,17 @@ Playback commands:
 | `!skip`, `!s` | Stop the current item and advance to the next request |
 | `!stop` | Stop playback and clear pending requests without closing VLC |
 | `!queue`, `!q` | Show the current item and pending URLs in an embed |
+
+The commands work in the configured server and in direct messages from the
+Discord application owner. DM commands from every other account are rejected.
+When the bot belongs to one server, owner DMs automatically share that server's
+queue and VLC player.
+Queue displays and failure messages redact credential-bearing links from TorBox,
+Real-Debrid, AllDebrid, Premiumize, and similar debrid services. Ordinary social
+media and YouTube links remain visible.
+When a sensitive link is submitted in a server channel, the bot deletes the
+original command before queuing it. It refuses the request if deletion fails.
+Messages sent directly to the bot are already private and are not deleted.
 
 Each server has an independent in-memory `GuildState`. Requests enter the queue
 as raw URLs; yt-dlp does not resolve a queued link until every earlier item has

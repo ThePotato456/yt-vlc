@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import unittest
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, PropertyMock, call, patch
 
 import discord
 
@@ -13,9 +13,13 @@ import discord_bot
 class FakeMessage:
     def __init__(self) -> None:
         self.edits: list[dict[str, object]] = []
+        self.deleted = False
 
     async def edit(self, **kwargs: object) -> None:
         self.edits.append(kwargs)
+
+    async def delete(self) -> None:
+        self.deleted = True
 
 
 class FakeRequester:
@@ -38,9 +42,23 @@ class FakeContext:
 
     def __init__(self) -> None:
         self.replies: list[str] = []
+        self.reply_options: list[dict[str, object]] = []
+        self.sent: list[str] = []
+        self.message = FakeMessage()
+        self.response_message = FakeMessage()
 
-    async def reply(self, content: str = "", **_: object) -> None:
+    async def reply(
+        self,
+        content: str = "",
+        **options: object,
+    ) -> FakeMessage:
         self.replies.append(content)
+        self.reply_options.append(options)
+        return self.response_message
+
+    async def send(self, content: str = "", **_: object) -> FakeMessage:
+        self.sent.append(content)
+        return self.response_message
 
 
 class FakeVLCSession:
@@ -78,6 +96,132 @@ class FakeVLCSession:
 
 
 class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_sensitive_request_is_deleted_before_queueing(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        command = bot.get_command("play")
+        self.assertIsNotNone(command)
+        context = FakeContext()
+        private_url = (
+            "https://nexus-220.cnam.tb-cdn.io/dld/example"
+            "?token=private-token"
+        )
+
+        with patch.object(discord_bot, "ensure_guild_worker"):
+            await command.callback(  # type: ignore[arg-type, union-attr]
+                context,
+                url=private_url,
+            )
+
+        state = discord_bot.GUILD_STATE.pop(123)
+        queued = state.queue.get_nowait()
+        state.queue.task_done()
+        self.assertTrue(context.message.deleted)
+        self.assertEqual(queued.url, private_url)
+        self.assertEqual(context.replies, [])
+        self.assertIn("Resolving request", context.sent[-1])
+
+    async def test_public_social_request_message_is_not_deleted(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        command = bot.get_command("play")
+        self.assertIsNotNone(command)
+        context = FakeContext()
+
+        with patch.object(discord_bot, "ensure_guild_worker"):
+            await command.callback(  # type: ignore[arg-type, union-attr]
+                context,
+                url="https://www.youtube.com/watch?v=public-video",
+            )
+
+        state = discord_bot.GUILD_STATE.pop(123)
+        state.queue.get_nowait()
+        state.queue.task_done()
+        self.assertFalse(context.message.deleted)
+        self.assertIn("Resolving request", context.replies[-1])
+
+    def test_sensitive_debrid_links_are_redacted_but_social_links_are_not(self) -> None:
+        sensitive = "https://api.torbox.app/v1/download?token=super-secret"
+        torbox_cdn = (
+            "https://nexus-220.cnam.tb-cdn.io/dld/example"
+            "?token=cdn-secret"
+        )
+        youtube = "https://www.youtube.com/watch?v=public-video"
+        social = "https://www.tiktok.com/@creator/video/123"
+        message = f"failed: {sensitive} {torbox_cdn} {youtube} {social}"
+
+        redacted = discord_bot.redact_sensitive_links(message)
+
+        self.assertNotIn("super-secret", redacted)
+        self.assertNotIn("cdn-secret", redacted)
+        self.assertIn(discord_bot.REDACTED_LINK, redacted)
+        self.assertIn(youtube, redacted)
+        self.assertIn(social, redacted)
+
+    def test_queue_embed_hides_debrid_credentials(self) -> None:
+        state = discord_bot.GuildState(guild_id=123)
+        state.queue.put_nowait(
+            discord_bot.MediaRequest(
+                url="https://download.real-debrid.com/d/secret-token/file.mkv",
+                requester=FakeRequester(),  # type: ignore[arg-type]
+                status_message=FakeMessage(),  # type: ignore[arg-type]
+            )
+        )
+
+        embed = discord_bot.queue_embed(state)
+
+        self.assertNotIn("secret-token", embed.description)
+        self.assertIn(discord_bot.REDACTED_LINK, embed.description)
+
+    async def test_only_the_bot_owner_can_use_dm_commands(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        command = bot.get_command("queue")
+        self.assertIsNotNone(command)
+
+        owner_context = FakeContext()
+        owner_context.guild = None  # type: ignore[assignment]
+        with patch.object(bot, "is_owner", new=AsyncMock(return_value=True)):
+            await command.callback(owner_context)  # type: ignore[arg-type, union-attr]
+        self.assertIsInstance(owner_context.reply_options[-1]["embed"], discord.Embed)
+
+        other_context = FakeContext()
+        other_context.guild = None  # type: ignore[assignment]
+        with patch.object(bot, "is_owner", new=AsyncMock(return_value=False)):
+            await command.callback(other_context)  # type: ignore[arg-type, union-attr]
+        self.assertEqual(other_context.replies, [])
+
+    async def test_owner_dm_automatically_targets_the_only_guild(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=None)
+        command = bot.get_command("queue")
+        self.assertIsNotNone(command)
+        context = FakeContext()
+        context.guild = None  # type: ignore[assignment]
+
+        state = discord_bot.GuildState(guild_id=123)
+        state.queue.put_nowait(
+            discord_bot.MediaRequest(
+                url="https://www.youtube.com/watch?v=private-request",
+                requester=FakeRequester(),  # type: ignore[arg-type]
+                status_message=FakeMessage(),  # type: ignore[arg-type]
+            )
+        )
+        discord_bot.GUILD_STATE[123] = state
+        try:
+            with (
+                patch.object(
+                    type(bot),
+                    "guilds",
+                    new_callable=PropertyMock,
+                    return_value=[FakeGuild()],
+                ),
+                patch.object(bot, "is_owner", new=AsyncMock(return_value=True)),
+            ):
+                await command.callback(context)  # type: ignore[arg-type, union-attr]
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        embed = context.reply_options[-1]["embed"]
+        self.assertIsInstance(embed, discord.Embed)
+        self.assertIn("private-request", embed.description)
+
     def test_queue_embed_stays_within_discord_limits(self) -> None:
         state = discord_bot.GuildState(guild_id=123)
         for index in range(100):

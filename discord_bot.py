@@ -7,6 +7,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -32,6 +33,30 @@ VLC_START_TIMEOUT = 10.0
 VLC_PLAYBACK_TIMEOUT = 30.0
 VLC_POLL_INTERVAL = 0.5
 ACTIVE_VLC_STATES = {"opening", "buffering", "playing", "paused"}
+SENSITIVE_LINK_DOMAINS = (
+    "alldebrid.com",
+    "alldebrid.fr",
+    "debrid-link.com",
+    "easy-debrid.com",
+    "easynews.com",
+    "linksnappy.com",
+    "offcloud.com",
+    "premiumize.me",
+    "real-debrid.com",
+    "tb-cdn.io",
+    "torbox.app",
+)
+SENSITIVE_HOST_MARKERS = (
+    "debrid",
+    "easynews",
+    "linksnappy",
+    "offcloud",
+    "premiumize",
+    "tb-cdn",
+    "torbox",
+)
+URL_IN_TEXT = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+REDACTED_LINK = "[sensitive debrid link redacted]"
 
 
 @dataclass(slots=True)
@@ -238,6 +263,28 @@ def validate_media_url(value: str) -> str:
     return url
 
 
+def is_sensitive_link(value: str) -> bool:
+    hostname = (urlparse(value).hostname or "").lower().rstrip(".")
+    domain_match = any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in SENSITIVE_LINK_DOMAINS
+    )
+    return domain_match or any(
+        marker in hostname for marker in SENSITIVE_HOST_MARKERS
+    )
+
+
+def redact_sensitive_links(value: str) -> str:
+    return URL_IN_TEXT.sub(
+        lambda match: (
+            REDACTED_LINK
+            if is_sensitive_link(match.group(0))
+            else match.group(0)
+        ),
+        value,
+    )
+
+
 def text_value(info: dict[str, object], key: str, fallback: str = "Unknown") -> str:
     value = info.get(key)
     return str(value) if yt_vlc.usable_metadata(value) else fallback
@@ -330,10 +377,14 @@ async def mark_requests_removed(
 
 
 def queue_line(request: MediaRequest, label: str) -> str:
-    url = request.url
-    if len(url) > 140:
-        url = f"{url[:137]}..."
-    return f"**{label}** <{url}> — {request.requester.mention}"
+    if is_sensitive_link(request.url):
+        rendered_url = f"`{REDACTED_LINK}`"
+    else:
+        url = request.url
+        if len(url) > 140:
+            url = f"{url[:137]}..."
+        rendered_url = f"<{url}>"
+    return f"**{label}** {rendered_url} — {request.requester.mention}"
 
 
 def queue_embed(state: GuildState | None) -> discord.Embed:
@@ -419,7 +470,9 @@ async def run_guild_queue(state: GuildState) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            message = str(error).strip() or type(error).__name__
+            message = redact_sensitive_links(
+                str(error).strip() or type(error).__name__
+            )
             await request.status_message.edit(
                 content=f"Request failed: {message[:MAX_DISCORD_TEXT]}",
                 embed=None,
@@ -451,12 +504,39 @@ def build_bot(
         allowed_mentions=discord.AllowedMentions.none(),
         description="Send media requests to yt-vlc.",
     )
-    def allowed_channel(ctx: commands.Context[commands.Bot]) -> bool:
+
+    @bot.check
+    async def owner_only_dms(ctx: commands.Context[commands.Bot]) -> bool:
+        return ctx.guild is not None or await bot.is_owner(ctx.author)
+
+    def dm_target_guild_id() -> int | None:
+        if configured_guild_id is not None:
+            return configured_guild_id
+        if len(bot.guilds) == 1:
+            return bot.guilds[0].id
+        return None
+
+    async def allowed_context(ctx: commands.Context[commands.Bot]) -> bool:
         if ctx.guild is None:
-            return False
+            if not await bot.is_owner(ctx.author):
+                return False
+            if dm_target_guild_id() is None:
+                await ctx.reply(
+                    "Set `DISCORD_GUILD_ID` to choose the server controlled "
+                    "by DM commands.",
+                    mention_author=False,
+                )
+                return False
+            return True
         if configured_guild_id is not None and ctx.guild.id != configured_guild_id:
             return False
         return request_channel_id is None or ctx.channel.id == request_channel_id
+
+    def target_guild_id(ctx: commands.Context[commands.Bot]) -> int:
+        guild_id = ctx.guild.id if ctx.guild is not None else dm_target_guild_id()
+        if guild_id is None:
+            raise RuntimeError("Could not determine the DM command's target guild")
+        return guild_id
 
     @bot.event
     async def on_ready() -> None:
@@ -472,7 +552,7 @@ def build_bot(
     @bot.command(name="play", aliases=["request", "p"])
     async def play_command(ctx: commands.Context[commands.Bot], *, url: str) -> None:
         """Queue a URL for lazy VLC playback."""
-        if not allowed_channel(ctx):
+        if not await allowed_context(ctx):
             return
         try:
             media_url = validate_media_url(url)
@@ -480,13 +560,38 @@ def build_bot(
             await ctx.reply(str(error), mention_author=False)
             return
 
-        assert ctx.guild is not None
-        state = get_guild_state(ctx.guild.id)
+        source_deleted = False
+        if ctx.guild is not None and is_sensitive_link(media_url):
+            try:
+                await ctx.message.delete()
+                source_deleted = True
+            except discord.NotFound:
+                source_deleted = True
+            except discord.Forbidden:
+                await ctx.send(
+                    "I could not safely accept that private link. Grant the bot "
+                    "**Manage Messages** permission so it can remove the original "
+                    "request.",
+                )
+                return
+            except discord.HTTPException:
+                await ctx.send(
+                    "I could not delete the message containing that private link, "
+                    "so the request was not queued.",
+                )
+                return
+
+        state = get_guild_state(target_guild_id(ctx))
         position = state.queue.qsize() + (1 if state.current else 0) + 1
-        progress = await ctx.reply(
-            "Resolving request…" if position == 1 else f"Queued at position {position}.",
-            mention_author=False,
+        status_text = (
+            "Resolving request…"
+            if position == 1
+            else f"Queued at position {position}."
         )
+        if source_deleted:
+            progress = await ctx.send(status_text)
+        else:
+            progress = await ctx.reply(status_text, mention_author=False)
         await state.queue.put(
             MediaRequest(
                 url=media_url,
@@ -501,7 +606,7 @@ def build_bot(
         ctx: commands.Context[commands.Bot],
         error: commands.CommandError,
     ) -> None:
-        if not allowed_channel(ctx):
+        if not await allowed_context(ctx):
             return
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.reply(
@@ -514,10 +619,9 @@ def build_bot(
     @bot.command(name="pause")
     async def pause_command(ctx: commands.Context[commands.Bot]) -> None:
         """Pause the current VLC item."""
-        if not allowed_channel(ctx):
+        if not await allowed_context(ctx):
             return
-        assert ctx.guild is not None
-        state = GUILD_STATE.get(ctx.guild.id)
+        state = GUILD_STATE.get(target_guild_id(ctx))
         if (
             state is None
             or state.current is None
@@ -538,10 +642,9 @@ def build_bot(
     @bot.command(name="resume")
     async def resume_command(ctx: commands.Context[commands.Bot]) -> None:
         """Resume the current VLC item."""
-        if not allowed_channel(ctx):
+        if not await allowed_context(ctx):
             return
-        assert ctx.guild is not None
-        state = GUILD_STATE.get(ctx.guild.id)
+        state = GUILD_STATE.get(target_guild_id(ctx))
         if (
             state is None
             or state.current is None
@@ -562,10 +665,9 @@ def build_bot(
     @bot.command(name="skip", aliases=["next", "s"])
     async def skip_command(ctx: commands.Context[commands.Bot]) -> None:
         """Stop the current item and advance the lazy queue."""
-        if not allowed_channel(ctx):
+        if not await allowed_context(ctx):
             return
-        assert ctx.guild is not None
-        state = GUILD_STATE.get(ctx.guild.id)
+        state = GUILD_STATE.get(target_guild_id(ctx))
         if state is None or state.current is None:
             await ctx.reply("Nothing is currently playing.", mention_author=False)
             return
@@ -586,10 +688,9 @@ def build_bot(
     @bot.command(name="stop")
     async def stop_command(ctx: commands.Context[commands.Bot]) -> None:
         """Stop playback, clear pending requests, and leave VLC open."""
-        if not allowed_channel(ctx):
+        if not await allowed_context(ctx):
             return
-        assert ctx.guild is not None
-        state = GUILD_STATE.get(ctx.guild.id)
+        state = GUILD_STATE.get(target_guild_id(ctx))
         if state is None:
             await ctx.reply("Nothing is playing or queued.", mention_author=False)
             return
@@ -635,10 +736,9 @@ def build_bot(
     @bot.command(name="queue", aliases=["q"])
     async def queue_command(ctx: commands.Context[commands.Bot]) -> None:
         """Show the current item and unresolved pending URLs."""
-        if not allowed_channel(ctx):
+        if not await allowed_context(ctx):
             return
-        assert ctx.guild is not None
-        state = GUILD_STATE.get(ctx.guild.id)
+        state = GUILD_STATE.get(target_guild_id(ctx))
         await ctx.reply(embed=queue_embed(state), mention_author=False)
 
     return bot
