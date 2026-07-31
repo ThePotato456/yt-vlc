@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import re
 import secrets
@@ -15,6 +16,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
@@ -32,6 +34,12 @@ MAX_QUEUE_EMBED_DESCRIPTION = 4_000
 VLC_START_TIMEOUT = 10.0
 VLC_PLAYBACK_TIMEOUT = 30.0
 VLC_POLL_INTERVAL = 0.5
+VLC_STALL_TIMEOUT = 12.0
+QUEUE_PREFETCH_SECONDS = 8.0
+STABILITY_FALLBACK_FORMAT = (
+    "b[height>=720][height<=720]/"
+    "bv*[height<=720]+ba/b[height<=720]/b"
+)
 ACTIVE_VLC_STATES = {"opening", "buffering", "playing", "paused"}
 SENSITIVE_LINK_DOMAINS = (
     "alldebrid.com",
@@ -71,6 +79,28 @@ class PreparedMedia:
     vlc: str
     streams: list[str]
     info: dict[str, object]
+
+
+@dataclass(slots=True)
+class PrefetchedRequest:
+    request: MediaRequest
+    task: asyncio.Task[PreparedMedia]
+
+
+class PlaybackStalled(RuntimeError):
+    def __init__(self, position_seconds: float) -> None:
+        self.position_seconds = position_seconds
+        super().__init__(
+            f"Playback stopped progressing near {yt_vlc.human_duration(position_seconds)}"
+        )
+
+
+def status_number(status: dict[str, object], key: str) -> float | None:
+    try:
+        value = float(status[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 class VLCSession:
@@ -177,15 +207,36 @@ class VLCSession:
             raise RuntimeError("VLC is not running")
         return self._request({"command": "pl_stop"})
 
+    def seek_when_ready(self, seconds: float) -> dict[str, object]:
+        if not self.is_running():
+            raise RuntimeError("VLC is not running")
+        deadline = time.monotonic() + VLC_PLAYBACK_TIMEOUT
+        while time.monotonic() < deadline:
+            status = self.status()
+            state_name = str(status.get("state", "")).lower()
+            if state_name in {"playing", "paused"}:
+                return self._request(
+                    {"command": "seek", "val": f"{max(0, round(seconds))}S"}
+                )
+            if not self.is_running():
+                raise RuntimeError("VLC closed before playback could resume")
+            time.sleep(0.1)
+        raise RuntimeError("VLC did not become ready to resume playback")
+
     async def wait_until_finished(
         self,
         initial_status: dict[str, object],
+        on_near_end: Callable[[], bool] | None = None,
     ) -> None:
         """Wait for the current item to stop without waiting for VLC to exit."""
         state_name = str(initial_status.get("state", "")).lower()
         seen_active = state_name in ACTIVE_VLC_STATES
         stopped_since: float | None = None
-        start_deadline = time.monotonic() + VLC_PLAYBACK_TIMEOUT
+        now = time.monotonic()
+        start_deadline = now + VLC_PLAYBACK_TIMEOUT
+        last_position = status_number(initial_status, "time")
+        last_progress_at = now
+        prefetch_started = False
 
         while True:
             if self.process is None or self.process.poll() is not None:
@@ -195,6 +246,8 @@ class VLCSession:
             status = await asyncio.to_thread(self.status)
             state_name = str(status.get("state", "")).lower()
             now = time.monotonic()
+            position = status_number(status, "time")
+            length = status_number(status, "length")
 
             if state_name in ACTIVE_VLC_STATES:
                 seen_active = True
@@ -206,6 +259,29 @@ class VLCSession:
                     stopped_since = now
                 elif now - stopped_since >= 2.0:
                     return
+
+            if state_name == "playing" and position is not None:
+                if last_position is None or abs(position - last_position) >= 0.5:
+                    last_position = position
+                    last_progress_at = now
+                elif (
+                    length is not None
+                    and length > 0
+                    and now - last_progress_at >= VLC_STALL_TIMEOUT
+                ):
+                    raise PlaybackStalled(position)
+            elif state_name in {"opening", "buffering", "paused"}:
+                last_progress_at = now
+
+            if (
+                not prefetch_started
+                and on_near_end is not None
+                and position is not None
+                and length is not None
+                and length > 0
+                and 0 < length - position <= QUEUE_PREFETCH_SECONDS
+            ):
+                prefetch_started = on_near_end()
 
             if not seen_active and now >= start_deadline:
                 raise RuntimeError("VLC did not begin playback")
@@ -221,6 +297,7 @@ class GuildState:
     vlc: VLCSession | None = None
     completion_note: str | None = None
     cancel_current: bool = False
+    prefetch: PrefetchedRequest | None = None
 
 
 # State is per guild even when this bot is configured for only one guild.
@@ -290,7 +367,10 @@ def text_value(info: dict[str, object], key: str, fallback: str = "Unknown") -> 
     return str(value) if yt_vlc.usable_metadata(value) else fallback
 
 
-def resolve_media(url: str) -> PreparedMedia:
+def resolve_media(
+    url: str,
+    format_selector: str = yt_vlc.DEFAULT_FORMAT,
+) -> PreparedMedia:
     """Resolve only the request currently at the head of a guild queue."""
     bundled_yt_dlp, bundled_vlc = yt_vlc.ensure_bundled_tools()
     yt_dlp = yt_vlc.find_program("yt-dlp", bundled=bundled_yt_dlp)
@@ -298,7 +378,7 @@ def resolve_media(url: str) -> PreparedMedia:
     streams, media_info = yt_vlc.resolve_streams(
         yt_dlp,
         url,
-        yt_vlc.DEFAULT_FORMAT,
+        format_selector,
     )
     return PreparedMedia(vlc=vlc, streams=streams, info=media_info)
 
@@ -350,6 +430,49 @@ def pending_requests(state: GuildState) -> tuple[MediaRequest, ...]:
     return tuple(state.queue._queue)  # type: ignore[attr-defined]
 
 
+def start_next_prefetch(state: GuildState) -> bool:
+    queued = pending_requests(state)
+    if not queued:
+        return False
+    request = queued[0]
+    if state.prefetch is not None:
+        if state.prefetch.request is request and not state.prefetch.task.cancelled():
+            return True
+        state.prefetch.task.cancel()
+    task = asyncio.create_task(
+        asyncio.to_thread(resolve_media, request.url),
+        name=f"yt-vlc-prefetch-{state.guild_id}",
+    )
+    state.prefetch = PrefetchedRequest(request=request, task=task)
+    return True
+
+
+async def resolve_queued_request(
+    state: GuildState,
+    request: MediaRequest,
+) -> PreparedMedia:
+    if state.prefetch is not None and state.prefetch.request is request:
+        task = state.prefetch.task
+        state.prefetch = None
+        return await task
+    return await asyncio.to_thread(resolve_media, request.url)
+
+
+def cancel_removed_prefetch(
+    state: GuildState,
+    removed: list[MediaRequest],
+) -> None:
+    if state.prefetch is None or not any(
+        request is state.prefetch.request for request in removed
+    ):
+        return
+    if state.prefetch.task.done() and not state.prefetch.task.cancelled():
+        state.prefetch.task.exception()
+    else:
+        state.prefetch.task.cancel()
+    state.prefetch = None
+
+
 def drain_pending_requests(state: GuildState) -> list[MediaRequest]:
     """Remove every request that has not reached the worker yet."""
     removed: list[MediaRequest] = []
@@ -358,6 +481,7 @@ def drain_pending_requests(state: GuildState) -> list[MediaRequest]:
             removed.append(state.queue.get_nowait())
             state.queue.task_done()
         except asyncio.QueueEmpty:
+            cancel_removed_prefetch(state, removed)
             return removed
 
 
@@ -431,15 +555,25 @@ def queue_embed(state: GuildState | None) -> discord.Embed:
 
 
 async def run_guild_queue(state: GuildState) -> None:
-    """Lazily resolve and play one request at a time for a guild."""
+    """Resolve, play, and recover queued requests for one guild."""
     while True:
         request = await state.queue.get()
         state.current = request
         state.completion_note = None
         state.cancel_current = False
         try:
-            await request.status_message.edit(content="Resolving request…")
-            media = await asyncio.to_thread(resolve_media, request.url)
+            using_prefetch = (
+                state.prefetch is not None
+                and state.prefetch.request is request
+            )
+            await request.status_message.edit(
+                content=(
+                    "Starting prepared request…"
+                    if using_prefetch
+                    else "Resolving request…"
+                )
+            )
+            media = await resolve_queued_request(state, request)
             if state.cancel_current:
                 await request.status_message.edit(
                     content=state.completion_note or "Request cancelled.",
@@ -464,8 +598,67 @@ async def run_guild_queue(state: GuildState) -> None:
             )
             await request.status_message.edit(content=None, embed=embed)
 
-            await state.vlc.wait_until_finished(initial_status)
-            embed.set_footer(text=state.completion_note or "Playback finished")
+            recovered = False
+            try:
+                await state.vlc.wait_until_finished(
+                    initial_status,
+                    on_near_end=lambda: start_next_prefetch(state),
+                )
+            except PlaybackStalled as stalled:
+                if state.cancel_current:
+                    await request.status_message.edit(
+                        content=state.completion_note or "Request cancelled.",
+                        embed=None,
+                    )
+                    continue
+                await request.status_message.edit(
+                    content="Playback stalled; reconnecting at up to 720p…",
+                    embed=embed,
+                )
+                media = await asyncio.to_thread(
+                    resolve_media,
+                    request.url,
+                    STABILITY_FALLBACK_FORMAT,
+                )
+                if state.cancel_current:
+                    await request.status_message.edit(
+                        content=state.completion_note or "Request cancelled.",
+                        embed=None,
+                    )
+                    continue
+                initial_status = await asyncio.to_thread(state.vlc.play, media)
+                if state.cancel_current:
+                    await asyncio.to_thread(state.vlc.stop)
+                    await request.status_message.edit(
+                        content=state.completion_note or "Request cancelled.",
+                        embed=None,
+                    )
+                    continue
+                if stalled.position_seconds >= 2:
+                    try:
+                        await asyncio.to_thread(
+                            state.vlc.seek_when_ready,
+                            stalled.position_seconds,
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        pass
+                embed = now_playing_embed(
+                    media.info,
+                    request.requester,
+                    len(media.streams),
+                )
+                embed.set_footer(text="Reconnected after a playback stall")
+                await request.status_message.edit(content=None, embed=embed)
+                recovered = True
+                await state.vlc.wait_until_finished(
+                    initial_status,
+                    on_near_end=lambda: start_next_prefetch(state),
+                )
+
+            completion = state.completion_note or "Playback finished"
+            if recovered and state.completion_note is None:
+                completion = "Playback finished • recovered at up to 720p"
+            embed.set_footer(text=completion)
             await request.status_message.edit(embed=embed)
         except asyncio.CancelledError:
             raise

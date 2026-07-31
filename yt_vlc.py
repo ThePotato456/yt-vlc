@@ -19,7 +19,10 @@ import zipfile
 from pathlib import Path
 
 
-DEFAULT_FORMAT = "bestvideo*+bestaudio/best"
+DEFAULT_FORMAT = (
+    "b[height>=720][height<=1080]/"
+    "bv*[height<=1080]+ba/b[height<=1080]/b"
+)
 APP_DIR = Path(__file__).resolve().parent
 BIN_DIR = APP_DIR / "bin"
 YT_DLP_URL = (
@@ -293,6 +296,9 @@ def format_help_text() -> str:
 
   {heading("Common selectors:")}
     {selector("best, b")}                       Best combined video and audio stream
+    {selector("b[height>=720][height<=1080]/")}
+      {selector("bv*[height<=1080]+ba/")}
+      {selector("b[height<=1080]/b")}            Prefer combined 720p+, otherwise up to 1080p
     {selector("bestvideo+bestaudio, bv+ba")}    Best separate video and audio streams
     {selector("bestvideo*+bestaudio/best")}     Best quality, with a combined fallback
     {selector("bv*[height<=1080]+ba/")}
@@ -312,13 +318,13 @@ def format_help_text() -> str:
 
 {heading("examples:")}
   {command('python yt_vlc.py "URL"')}
-  {command('python yt_vlc.py -f "bv*[height<=1080]+ba/b[height<=1080]" "URL"')}
+  {command('python yt_vlc.py -f "b[height>=720][height<=1080]/bv*[height<=1080]+ba/b[height<=1080]/b" "URL"')}
   {command('python yt_vlc.py -f "137+140" "URL"')}
   {command('python yt_vlc.py --print-only "URL"')}
 
-The default selector is {selector(DEFAULT_FORMAT)}. VLC receives one combined
-URL when available, or a video URL with the audio URL attached as an input
-slave when yt-dlp returns two streams.
+The default selector is {selector(DEFAULT_FORMAT)}. It uses a combined stream
+only at 720p or better, otherwise selecting separate video and audio up to
+1080p. Lower resolutions remain final compatibility fallbacks.
 
 On first use, pinned Windows executables are downloaded into ./bin. Existing
 files are reused; --yt-dlp and --vlc override the bundled executable paths.
@@ -520,7 +526,7 @@ def parse_args() -> argparse.Namespace:
         "-f",
         "--format",
         default=DEFAULT_FORMAT,
-        help=f"yt-dlp format selector (default: {DEFAULT_FORMAT})",
+        help="yt-dlp format selector (default: combined 720p+ or up to 1080p)",
     )
     parser.add_argument("--yt-dlp", metavar="PATH", help="yt-dlp executable or path")
     parser.add_argument("--vlc", metavar="PATH", help="VLC executable or path")

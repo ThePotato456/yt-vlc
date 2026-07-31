@@ -26,6 +26,7 @@ video as VLC's primary input and attaches the audio with `--input-slave`.
 
 - Plays supported media pages directly in VLC
 - Handles combined streams and separate video/audio streams
+- Uses combined streams only at 720p or better, otherwise preferring up to 1080p
 - Replaces the currently playing VLC item when the script is run again
 - Provides a colorized, in-place status line that keeps terminal output compact
 - Displays live progress bars while downloading prerequisites
@@ -141,14 +142,18 @@ When a sensitive link is submitted in a server channel, the bot deletes the
 original command before queuing it. It refuses the request if deletion fails.
 Messages sent directly to the bot are already private and are not deleted.
 
-Each server has an independent in-memory `GuildState`. Requests enter the queue
-as raw URLs; yt-dlp does not resolve a queued link until every earlier item has
-finished playing. The bot keeps one VLC window open and controls it through a
-password-protected localhost interface, so a Discord screen share stays attached
-between requests. Reaching the end, pressing VLC's Stop button, or using `!skip`
-advances the queue; `!stop` clears the pending queue instead. The next URL is
-resolved only when it reaches the front. A compact **Now playing** response is
-posted at that point.
+Each server has an independent in-memory `GuildState`. Requests enter as raw
+URLs. To shorten transitions without letting signed links age in the queue, the
+bot prepares only the next request when VLC reaches the final eight seconds of
+the current item. It never starts that item early. The bot keeps one VLC window
+open through a password-protected localhost interface, so a Discord screen share
+stays attached between requests. Reaching the end, pressing VLC's Stop button,
+or using `!skip` advances the queue; `!stop` clears the pending queue instead.
+
+If playback time stops advancing for 12 seconds, the bot re-resolves the current
+request once with a combined-first 720p fallback and attempts to resume near the
+previous timestamp. Recovery is limited to one attempt so a bad source cannot
+loop indefinitely.
 
 ## Format selection
 
@@ -167,6 +172,7 @@ python .\yt_vlc.py -f "bv*[height<=1080]+ba/b[height<=1080]" "URL"
 | Selector | Behavior |
 |---|---|
 | `best` or `b` | Best combined video and audio stream |
+| `b[height>=720][height<=1080]/bv*[height<=1080]+ba/b[height<=1080]/b` | Combined at 720p+, otherwise separate streams up to 1080p |
 | `bestvideo+bestaudio` or `bv+ba` | Best separate video and audio streams |
 | `bestvideo*+bestaudio/best` | Best quality with a combined-stream fallback |
 | `bv*[height<=1080]+ba/b[height<=1080]` | Best stream up to 1080p |
@@ -184,7 +190,8 @@ Selector operators:
 | `/` | Fall back to the next selector |
 | `[...]` | Filter by properties such as height, extension, or codec |
 
-The default selector is `bestvideo*+bestaudio/best`.
+The default selector is
+`b[height>=720][height<=1080]/bv*[height<=1080]+ba/b[height<=1080]/b`.
 
 ## Command-line options
 

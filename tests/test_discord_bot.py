@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, PropertyMock, call, patch
 import discord
 
 import discord_bot
+import yt_vlc
 
 
 class FakeMessage:
@@ -67,19 +68,31 @@ class FakeVLCSession:
         executable: str,
         first_finished: asyncio.Event,
         second_finished: asyncio.Event,
+        trigger_prefetch: bool = False,
     ) -> None:
         self.executable = executable
         self.first_finished = first_finished
         self.second_finished = second_finished
         self.played: list[str] = []
         self.stop_calls = 0
+        self.trigger_prefetch = trigger_prefetch
 
     def play(self, media: discord_bot.PreparedMedia) -> dict[str, object]:
         self.played.append(media.streams[0])
         return {"state": "playing"}
 
-    async def wait_until_finished(self, _: dict[str, object]) -> None:
+    async def wait_until_finished(
+        self,
+        _: dict[str, object],
+        on_near_end: object = None,
+    ) -> None:
         current = self.played[-1]
+        if (
+            self.trigger_prefetch
+            and current == "https://example.com/first"
+            and callable(on_near_end)
+        ):
+            on_near_end()
         finished = (
             self.first_finished
             if current == "https://example.com/first"
@@ -96,6 +109,109 @@ class FakeVLCSession:
 
 
 class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
+    def test_default_format_rejects_low_resolution_combined_streams(self) -> None:
+        self.assertEqual(
+            yt_vlc.DEFAULT_FORMAT,
+            "b[height>=720][height<=1080]/"
+            "bv*[height<=1080]+ba/b[height<=1080]/b",
+        )
+
+    async def test_stalled_playback_is_detected(self) -> None:
+        class RunningProcess:
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+        session = discord_bot.VLCSession("vlc.exe")
+        session.process = RunningProcess()  # type: ignore[assignment]
+        stalled_status = {"state": "playing", "time": 10, "length": 100}
+        with (
+            patch.object(session, "status", return_value=stalled_status),
+            patch.object(
+                discord_bot.time,
+                "monotonic",
+                side_effect=[0.0, discord_bot.VLC_STALL_TIMEOUT + 1],
+            ),
+        ):
+            with self.assertRaises(discord_bot.PlaybackStalled) as raised:
+                await session.wait_until_finished(stalled_status)
+
+        self.assertEqual(raised.exception.position_seconds, 10)
+
+    async def test_stall_reconnects_once_at_720p_and_resumes_position(self) -> None:
+        class RecoveringVLC:
+            executable = "vlc.exe"
+
+            def __init__(self) -> None:
+                self.played: list[str] = []
+                self.wait_calls = 0
+                self.seek_positions: list[float] = []
+
+            def play(self, media: discord_bot.PreparedMedia) -> dict[str, object]:
+                self.played.append(media.streams[0])
+                return {"state": "playing"}
+
+            async def wait_until_finished(
+                self,
+                _: dict[str, object],
+                on_near_end: object = None,
+            ) -> None:
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise discord_bot.PlaybackStalled(42)
+
+            def seek_when_ready(self, seconds: float) -> dict[str, object]:
+                self.seek_positions.append(seconds)
+                return {"state": "playing"}
+
+        selectors: list[str] = []
+
+        def fake_resolve(
+            _: str,
+            selector: str = yt_vlc.DEFAULT_FORMAT,
+        ) -> discord_bot.PreparedMedia:
+            selectors.append(selector)
+            return discord_bot.PreparedMedia(
+                vlc="vlc.exe",
+                streams=[f"stream-{len(selectors)}"],
+                info={"title": "Test media"},
+            )
+
+        state = discord_bot.GuildState(guild_id=123)
+        vlc = RecoveringVLC()
+        state.vlc = vlc  # type: ignore[assignment]
+        await state.queue.put(
+            discord_bot.MediaRequest(
+                url="https://example.com/media",
+                requester=FakeRequester(),  # type: ignore[arg-type]
+                status_message=FakeMessage(),  # type: ignore[arg-type]
+            )
+        )
+
+        with (
+            patch.object(discord_bot, "resolve_media", side_effect=fake_resolve),
+            patch.object(
+                discord_bot,
+                "now_playing_embed",
+                return_value=discord.Embed(title="Now playing"),
+            ),
+        ):
+            worker = asyncio.create_task(discord_bot.run_guild_queue(state))
+            try:
+                await asyncio.wait_for(state.queue.join(), timeout=1)
+            finally:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
+        self.assertEqual(
+            selectors,
+            [yt_vlc.DEFAULT_FORMAT, discord_bot.STABILITY_FALLBACK_FORMAT],
+        )
+        self.assertEqual(vlc.played, ["stream-1", "stream-2"])
+        self.assertEqual(vlc.seek_positions, [42])
+
     async def test_public_sensitive_request_is_deleted_before_queueing(self) -> None:
         bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
         command = bot.get_command("play")
@@ -470,6 +586,72 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
 
                 first_finished.set()
                 await asyncio.wait_for(second_resolved.wait(), timeout=1)
+                second_finished.set()
+                await asyncio.wait_for(state.queue.join(), timeout=1)
+            finally:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
+    async def test_next_url_is_prefetched_only_when_playback_nears_end(self) -> None:
+        first_finished = asyncio.Event()
+        second_finished = asyncio.Event()
+        first_resolved = asyncio.Event()
+        second_resolved = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def fake_resolve(url: str) -> discord_bot.PreparedMedia:
+            event = first_resolved if url.endswith("first") else second_resolved
+            loop.call_soon_threadsafe(event.set)
+            return discord_bot.PreparedMedia(
+                vlc="vlc.exe",
+                streams=[url],
+                info={"title": url},
+            )
+
+        state = discord_bot.GuildState(guild_id=123)
+        vlc = FakeVLCSession(
+            "vlc.exe",
+            first_finished,
+            second_finished,
+            trigger_prefetch=True,
+        )
+        state.vlc = vlc  # type: ignore[assignment]
+        await state.queue.put(
+            discord_bot.MediaRequest(
+                url="https://example.com/first",
+                requester=FakeRequester(),  # type: ignore[arg-type]
+                status_message=FakeMessage(),  # type: ignore[arg-type]
+            )
+        )
+        await state.queue.put(
+            discord_bot.MediaRequest(
+                url="https://example.com/second",
+                requester=FakeRequester(),  # type: ignore[arg-type]
+                status_message=FakeMessage(),  # type: ignore[arg-type]
+            )
+        )
+
+        with (
+            patch.object(discord_bot, "resolve_media", side_effect=fake_resolve),
+            patch.object(
+                discord_bot,
+                "now_playing_embed",
+                return_value=discord.Embed(title="Now playing"),
+            ),
+        ):
+            worker = asyncio.create_task(discord_bot.run_guild_queue(state))
+            try:
+                await asyncio.wait_for(first_resolved.wait(), timeout=1)
+                await asyncio.wait_for(second_resolved.wait(), timeout=1)
+                self.assertEqual(vlc.played, ["https://example.com/first"])
+
+                first_finished.set()
+                for _ in range(20):
+                    if len(vlc.played) == 2:
+                        break
+                    await asyncio.sleep(0)
+                self.assertEqual(vlc.played[-1], "https://example.com/second")
                 second_finished.set()
                 await asyncio.wait_for(state.queue.join(), timeout=1)
             finally:
