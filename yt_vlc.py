@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -22,16 +23,71 @@ YT_DLP_URL = (
     "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp.exe"
 )
 VLC_URL = "https://get.videolan.org/vlc/3.0.23/win64/vlc-3.0.23-win64.zip"
+CHUNK_SIZE = 256 * 1024
+
+BANNER = r"""
+ __   _______       __     ___     ____
+ \ \ / /_   _|      \ \   / / |   / ___|
+  \ V /  | |  _____  \ \ / /| |  | |
+   | |   | | |_____|  \ V / | |__| |___
+   |_|   |_|           \_/  |_____\____|
+"""
 
 
-def colored(text: str, code: str) -> str:
-    """Apply terminal color when help is being displayed interactively."""
-    enabled = (
-        sys.stdout.isatty()
+def supports_color(stream: object = sys.stdout) -> bool:
+    """Return whether a stream supports interactive ANSI styling."""
+    is_tty = getattr(stream, "isatty", lambda: False)()
+    return (
+        is_tty
         and "NO_COLOR" not in os.environ
         and os.environ.get("TERM", "").lower() != "dumb"
     )
-    return f"\033[{code}m{text}\033[0m" if enabled else text
+
+
+def colored(text: str, code: str, stream: object = sys.stdout) -> str:
+    """Apply terminal color when supported by the destination stream."""
+    return f"\033[{code}m{text}\033[0m" if supports_color(stream) else text
+
+
+def ui(message: str = "", *, end: str = "\n") -> None:
+    """Write user-interface output to stderr, preserving stdout for stream URLs."""
+    print(message, end=end, file=sys.stderr, flush=True)
+
+
+def print_banner() -> None:
+    ui(colored(BANNER.rstrip(), "1;36", sys.stderr))
+    ui(colored("       direct network playback via yt-dlp + VLC", "2", sys.stderr))
+    ui()
+
+
+def status(label: str, message: str, color: str = "36") -> None:
+    marker = colored(f"[{label}]", f"1;{color}", sys.stderr)
+    ui(f"{marker} {message}")
+
+
+def human_size(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GiB"
+
+
+def progress_line(name: str, downloaded: int, total: int | None) -> str:
+    terminal_width = shutil.get_terminal_size(fallback=(88, 24)).columns
+    bar_width = max(12, min(32, terminal_width - 52))
+    if total and total > 0:
+        fraction = min(downloaded / total, 1.0)
+        filled = round(bar_width * fraction)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        return (
+            f"  {name:<12} [{bar}] {fraction:>6.1%}  "
+            f"{human_size(downloaded):>9} / {human_size(total)}"
+        )
+    pulse = (downloaded // CHUNK_SIZE) % bar_width
+    bar = "-" * pulse + ">" + "-" * (bar_width - pulse - 1)
+    return f"  {name:<12} [{bar}]  {human_size(downloaded):>9}"
 
 
 def format_help_text() -> str:
@@ -82,13 +138,32 @@ def download(url: str, destination: Path) -> None:
     """Download to a temporary sibling, then atomically move it into place."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.download")
-    print(f"Downloading {destination.name}...")
+    status("GET", f"Downloading {destination.name}", "34")
     request = urllib.request.Request(url, headers={"User-Agent": "yt-vlc/1.0"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
+            raw_length = response.headers.get("Content-Length")
+            total = int(raw_length) if raw_length and raw_length.isdigit() else None
+            downloaded = 0
+            interactive = sys.stderr.isatty()
             with temporary.open("wb") as output:
-                shutil.copyfileobj(response, output)
+                while chunk := response.read(CHUNK_SIZE):
+                    output.write(chunk)
+                    downloaded += len(chunk)
+                    if interactive:
+                        ui(progress_line(destination.name, downloaded, total), end="\r")
+            if interactive:
+                ui(
+                    " "
+                    * max(
+                        0,
+                        shutil.get_terminal_size(fallback=(88, 24)).columns - 1,
+                    ),
+                    end="\r",
+                )
+            ui(progress_line(destination.name, downloaded, total))
         temporary.replace(destination)
+        status("OK", f"Downloaded {destination.name} ({human_size(downloaded)})", "32")
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
@@ -145,13 +220,18 @@ def ensure_bundled_tools() -> tuple[Path, Path]:
 
     if not yt_dlp.is_file():
         download(YT_DLP_URL, yt_dlp)
+    else:
+        status("OK", "yt-dlp is ready", "32")
 
     if not vlc.is_file():
         with tempfile.TemporaryDirectory(prefix="yt-vlc-") as temporary_dir:
             archive = Path(temporary_dir) / "vlc.zip"
             download(VLC_URL, archive)
-            print("Extracting portable VLC (DLLs and plugins included)...")
+            status("...", "Extracting portable VLC", "33")
             extract_portable_vlc(archive, vlc_directory)
+            status("OK", "Portable VLC extracted", "32")
+    else:
+        status("OK", "VLC is ready", "32")
 
     return yt_dlp, vlc
 
@@ -249,36 +329,45 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        page_url = args.url or input("Media URL: ").strip()
+        print_banner()
+        page_url = args.url
+        if not page_url:
+            ui(colored("Media URL", "1;36", sys.stderr) + ": ", end="")
+            page_url = input().strip()
         if not page_url:
             raise RuntimeError("No media URL was provided")
 
+        stage_count = 2 if args.print_only else 3
+        status(f"1/{stage_count}", "Checking prerequisites")
         bundled_yt_dlp, bundled_vlc = ensure_bundled_tools()
         yt_dlp = find_program("yt-dlp", args.yt_dlp, bundled_yt_dlp)
+
+        status(f"2/{stage_count}", "Resolving network streams")
+        started = time.monotonic()
         streams = resolve_streams(yt_dlp, page_url, args.format)
+        elapsed = time.monotonic() - started
+        stream_description = (
+            "separate video + audio" if len(streams) == 2 else "combined video/audio"
+        )
+        status(
+            "OK",
+            f"Resolved {len(streams)} stream{'s' if len(streams) != 1 else ''} "
+            f"({stream_description}) in {elapsed:.1f}s",
+            "32",
+        )
 
         if args.print_only:
             print("\n".join(streams))
             return 0
 
         vlc = find_program("vlc", args.vlc, bundled_vlc)
-        if len(streams) == 2:
-            print("Opening separate video and audio streams in VLC...")
-        else:
-            print("Opening combined stream in VLC...")
-        process = subprocess.Popen(vlc_command(vlc, streams), cwd=Path(vlc).parent)
-        try:
-            exit_code = process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            return 0
-        if exit_code:
-            status = f"0x{exit_code:08X}" if os.name == "nt" else str(exit_code)
-            raise RuntimeError(
-                f"VLC exited immediately with code {exit_code} ({status})"
-            )
+        status("3/3", f"Opening {stream_description} in VLC")
+        subprocess.Popen(vlc_command(vlc, streams), cwd=Path(vlc).parent)
+        status("OK", "Stream handed off to VLC — enjoy", "32")
         return 0
     except (EOFError, KeyboardInterrupt):
-        print("\nCancelled.", file=sys.stderr)
+        ui()
+        status("--", "Cancelled", "33")
         return 130
     except (
         FileNotFoundError,
@@ -287,7 +376,7 @@ def main() -> int:
         urllib.error.URLError,
         zipfile.BadZipFile,
     ) as error:
-        print(f"error: {error}", file=sys.stderr)
+        status("ERR", str(error), "31")
         return 1
 
 

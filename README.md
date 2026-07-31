@@ -16,6 +16,8 @@ video as VLC's primary input and attaches the audio with `--input-slave`.
 
 - Plays supported media pages directly in VLC
 - Handles combined streams and separate video/audio streams
+- Provides a polished, colorized terminal interface with staged status updates
+- Displays live progress bars while downloading prerequisites
 - Supports the full yt-dlp format-selector syntax
 - Downloads pinned Windows builds of yt-dlp and portable VLC automatically
 - Reuses local tools after the first run
