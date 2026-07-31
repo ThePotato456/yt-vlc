@@ -85,6 +85,45 @@ $URL = "https://www.youtube.com/watch?v=VIDEO_ID"
 python .\yt_vlc.py $URL
 ```
 
+## Discord requests
+
+The optional Discord bot accepts `!play <URL>` and adds the request to a lazy
+playback queue. Run the bot on the same logged-in Windows session as VLC.
+
+1. Create an application and bot in the
+   [Discord Developer Portal](https://discord.com/developers/applications).
+2. On the bot settings page, enable **Message Content Intent**.
+3. Invite the bot with **View Channels**, **Send Messages**, and
+   **Read Message History** permissions.
+4. Install the Python dependency and create the local configuration:
+
+   ```powershell
+   python -m pip install -r .\requirements.txt
+   Copy-Item .\.env.example .\.env
+   ```
+
+5. Add the bot token to `.env`. Set `DISCORD_GUILD_ID` for the intended server,
+   and optionally set `DISCORD_REQUEST_CHANNEL_ID` for one request channel.
+6. Start the bot:
+
+   ```powershell
+   python .\discord_bot.py
+   ```
+
+Request media from Discord:
+
+```text
+!play https://www.youtube.com/watch?v=VIDEO_ID
+```
+
+Each server has an independent in-memory `GuildState`. Requests enter the queue
+as raw URLs; yt-dlp does not resolve a queued link until every earlier item has
+finished playing. The bot keeps one VLC window open and controls it through a
+password-protected localhost interface, so a Discord screen share stays attached
+between requests. Reaching the end or pressing Stop advances the queue; the next
+URL is resolved only at that point. A compact **Now playing** response is posted
+only when that request reaches the front.
+
 ## Format selection
 
 Available formats depend on the media and website. Inspect them with:
