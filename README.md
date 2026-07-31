@@ -116,13 +116,25 @@ Request media from Discord:
 !play https://www.youtube.com/watch?v=VIDEO_ID
 ```
 
+Playback commands:
+
+| Command | Behavior |
+|---|---|
+| `!play <URL>`, `!p <URL>` | Add a media URL to the lazy queue |
+| `!pause` | Pause the current item |
+| `!resume` | Resume the paused item |
+| `!skip`, `!s` | Stop the current item and advance to the next request |
+| `!stop` | Stop playback and clear pending requests without closing VLC |
+| `!queue`, `!q` | Show the current item and pending URLs in an embed |
+
 Each server has an independent in-memory `GuildState`. Requests enter the queue
 as raw URLs; yt-dlp does not resolve a queued link until every earlier item has
 finished playing. The bot keeps one VLC window open and controls it through a
 password-protected localhost interface, so a Discord screen share stays attached
-between requests. Reaching the end or pressing Stop advances the queue; the next
-URL is resolved only at that point. A compact **Now playing** response is posted
-only when that request reaches the front.
+between requests. Reaching the end, pressing VLC's Stop button, or using `!skip`
+advances the queue; `!stop` clears the pending queue instead. The next URL is
+resolved only when it reaches the front. A compact **Now playing** response is
+posted at that point.
 
 ## Format selection
 

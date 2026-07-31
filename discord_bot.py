@@ -27,6 +27,7 @@ APP_DIR = Path(__file__).resolve().parent
 ENV_FILE = APP_DIR / ".env"
 COMMAND_PREFIX = "!"
 MAX_DISCORD_TEXT = 1_000
+MAX_QUEUE_EMBED_DESCRIPTION = 4_000
 VLC_START_TIMEOUT = 10.0
 VLC_PLAYBACK_TIMEOUT = 30.0
 VLC_POLL_INTERVAL = 0.5
@@ -81,6 +82,9 @@ class VLCSession:
     def status(self) -> dict[str, object]:
         return self._request()
 
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
     def _wait_until_ready(self) -> None:
         assert self.process is not None
         deadline = time.monotonic() + VLC_START_TIMEOUT
@@ -133,6 +137,21 @@ class VLCSession:
             command["option"] = f"input-slave={media.streams[1]}"
         return self._request(command)
 
+    def pause(self) -> dict[str, object]:
+        if not self.is_running():
+            raise RuntimeError("VLC is not running")
+        return self._request({"command": "pl_forcepause"})
+
+    def resume(self) -> dict[str, object]:
+        if not self.is_running():
+            raise RuntimeError("VLC is not running")
+        return self._request({"command": "pl_forceresume"})
+
+    def stop(self) -> dict[str, object]:
+        if not self.is_running():
+            raise RuntimeError("VLC is not running")
+        return self._request({"command": "pl_stop"})
+
     async def wait_until_finished(
         self,
         initial_status: dict[str, object],
@@ -175,6 +194,8 @@ class GuildState:
     worker: asyncio.Task[None] | None = None
     current: MediaRequest | None = None
     vlc: VLCSession | None = None
+    completion_note: str | None = None
+    cancel_current: bool = False
 
 
 # State is per guild even when this bot is configured for only one guild.
@@ -277,18 +298,114 @@ def get_guild_state(guild_id: int) -> GuildState:
     return state
 
 
+def pending_requests(state: GuildState) -> tuple[MediaRequest, ...]:
+    """Return a stable display snapshot without removing queue entries."""
+    return tuple(state.queue._queue)  # type: ignore[attr-defined]
+
+
+def drain_pending_requests(state: GuildState) -> list[MediaRequest]:
+    """Remove every request that has not reached the worker yet."""
+    removed: list[MediaRequest] = []
+    while True:
+        try:
+            removed.append(state.queue.get_nowait())
+            state.queue.task_done()
+        except asyncio.QueueEmpty:
+            return removed
+
+
+async def mark_requests_removed(
+    requests: list[MediaRequest],
+    reason: str,
+) -> None:
+    if not requests:
+        return
+    await asyncio.gather(
+        *(
+            request.status_message.edit(content=reason, embed=None)
+            for request in requests
+        ),
+        return_exceptions=True,
+    )
+
+
+def queue_line(request: MediaRequest, label: str) -> str:
+    url = request.url
+    if len(url) > 140:
+        url = f"{url[:137]}..."
+    return f"**{label}** <{url}> — {request.requester.mention}"
+
+
+def queue_embed(state: GuildState | None) -> discord.Embed:
+    current = state.current if state is not None else None
+    queued = pending_requests(state) if state is not None else ()
+    entries: list[tuple[MediaRequest, str]] = []
+    if current is not None:
+        entries.append((current, "Current"))
+    entries.extend(
+        (request, str(position))
+        for position, request in enumerate(queued, start=1)
+    )
+
+    lines: list[str] = []
+    for request, label in entries:
+        line = queue_line(request, label)
+        candidate = "\n".join((*lines, line))
+        if len(candidate) > MAX_QUEUE_EMBED_DESCRIPTION - 40:
+            break
+        lines.append(line)
+
+    omitted = len(entries) - len(lines)
+    if omitted:
+        lines.append(f"*...and {omitted} more request{'s' if omitted != 1 else ''}.*")
+
+    description = (
+        "\n".join(lines)
+        if lines
+        else "No media is currently playing or queued."
+    )
+    embed = discord.Embed(
+        title="Request queue",
+        description=description,
+        color=0xF26B38,
+    )
+    pending_count = len(queued)
+    embed.set_footer(
+        text=(
+            f"{pending_count} pending request"
+            f"{'s' if pending_count != 1 else ''}"
+        )
+    )
+    return embed
+
+
 async def run_guild_queue(state: GuildState) -> None:
     """Lazily resolve and play one request at a time for a guild."""
     while True:
         request = await state.queue.get()
         state.current = request
+        state.completion_note = None
+        state.cancel_current = False
         try:
             await request.status_message.edit(content="Resolving request…")
             media = await asyncio.to_thread(resolve_media, request.url)
+            if state.cancel_current:
+                await request.status_message.edit(
+                    content=state.completion_note or "Request cancelled.",
+                    embed=None,
+                )
+                continue
             if state.vlc is None or state.vlc.executable != media.vlc:
                 state.vlc = VLCSession(media.vlc)
 
             initial_status = await asyncio.to_thread(state.vlc.play, media)
+            if state.cancel_current:
+                await asyncio.to_thread(state.vlc.stop)
+                await request.status_message.edit(
+                    content=state.completion_note or "Request cancelled.",
+                    embed=None,
+                )
+                continue
             embed = now_playing_embed(
                 media.info,
                 request.requester,
@@ -297,7 +414,7 @@ async def run_guild_queue(state: GuildState) -> None:
             await request.status_message.edit(content=None, embed=embed)
 
             await state.vlc.wait_until_finished(initial_status)
-            embed.set_footer(text="Playback finished")
+            embed.set_footer(text=state.completion_note or "Playback finished")
             await request.status_message.edit(embed=embed)
         except asyncio.CancelledError:
             raise
@@ -309,6 +426,8 @@ async def run_guild_queue(state: GuildState) -> None:
             )
         finally:
             state.current = None
+            state.completion_note = None
+            state.cancel_current = False
             state.queue.task_done()
 
 
@@ -350,7 +469,7 @@ def build_bot(
         )
         print(f"Discord bot ready as {bot.user} ({guild_note}, {channel_note})")
 
-    @bot.command(name="play", aliases=["request"])
+    @bot.command(name="play", aliases=["request", "p"])
     async def play_command(ctx: commands.Context[commands.Bot], *, url: str) -> None:
         """Queue a URL for lazy VLC playback."""
         if not allowed_channel(ctx):
@@ -391,6 +510,136 @@ def build_bot(
             )
             return
         raise error
+
+    @bot.command(name="pause")
+    async def pause_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Pause the current VLC item."""
+        if not allowed_channel(ctx):
+            return
+        assert ctx.guild is not None
+        state = GUILD_STATE.get(ctx.guild.id)
+        if (
+            state is None
+            or state.current is None
+            or state.vlc is None
+            or not state.vlc.is_running()
+        ):
+            await ctx.reply("Nothing is currently playing.", mention_author=False)
+            return
+        try:
+            await asyncio.to_thread(state.vlc.pause)
+            await ctx.reply("Playback paused.", mention_author=False)
+        except Exception as error:
+            await ctx.reply(
+                f"Could not pause VLC: {str(error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+
+    @bot.command(name="resume")
+    async def resume_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Resume the current VLC item."""
+        if not allowed_channel(ctx):
+            return
+        assert ctx.guild is not None
+        state = GUILD_STATE.get(ctx.guild.id)
+        if (
+            state is None
+            or state.current is None
+            or state.vlc is None
+            or not state.vlc.is_running()
+        ):
+            await ctx.reply("Nothing is available to resume.", mention_author=False)
+            return
+        try:
+            await asyncio.to_thread(state.vlc.resume)
+            await ctx.reply("Playback resumed.", mention_author=False)
+        except Exception as error:
+            await ctx.reply(
+                f"Could not resume VLC: {str(error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+
+    @bot.command(name="skip", aliases=["next", "s"])
+    async def skip_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Stop the current item and advance the lazy queue."""
+        if not allowed_channel(ctx):
+            return
+        assert ctx.guild is not None
+        state = GUILD_STATE.get(ctx.guild.id)
+        if state is None or state.current is None:
+            await ctx.reply("Nothing is currently playing.", mention_author=False)
+            return
+        try:
+            state.completion_note = f"Skipped by {ctx.author.display_name}"
+            state.cancel_current = True
+            if state.vlc is not None and state.vlc.is_running():
+                await asyncio.to_thread(state.vlc.stop)
+            await ctx.reply("Skipped the current request.", mention_author=False)
+        except Exception as error:
+            state.completion_note = None
+            state.cancel_current = False
+            await ctx.reply(
+                f"Could not skip the request: {str(error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+
+    @bot.command(name="stop")
+    async def stop_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Stop playback, clear pending requests, and leave VLC open."""
+        if not allowed_channel(ctx):
+            return
+        assert ctx.guild is not None
+        state = GUILD_STATE.get(ctx.guild.id)
+        if state is None:
+            await ctx.reply("Nothing is playing or queued.", mention_author=False)
+            return
+
+        removed = drain_pending_requests(state)
+        stopped = state.current is not None
+        try:
+            if state.current is not None:
+                state.completion_note = f"Stopped by {ctx.author.display_name}"
+                state.cancel_current = True
+                if state.vlc is not None and state.vlc.is_running():
+                    await asyncio.to_thread(state.vlc.stop)
+            elif state.vlc is not None and state.vlc.is_running() and removed:
+                await asyncio.to_thread(state.vlc.stop)
+        except Exception as error:
+            state.completion_note = None
+            state.cancel_current = False
+            await ctx.reply(
+                f"Could not stop VLC: {str(error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+            return
+        finally:
+            await mark_requests_removed(
+                removed,
+                f"Removed from the queue by {ctx.author.display_name}.",
+            )
+
+        if not stopped and not removed:
+            await ctx.reply("Nothing is playing or queued.", mention_author=False)
+            return
+        queue_note = (
+            f" Cleared {len(removed)} pending request"
+            f"{'s' if len(removed) != 1 else ''}."
+            if removed
+            else ""
+        )
+        await ctx.reply(
+            f"Playback stopped; VLC remains open.{queue_note}",
+            mention_author=False,
+        )
+
+    @bot.command(name="queue", aliases=["q"])
+    async def queue_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Show the current item and unresolved pending URLs."""
+        if not allowed_channel(ctx):
+            return
+        assert ctx.guild is not None
+        state = GUILD_STATE.get(ctx.guild.id)
+        await ctx.reply(embed=queue_embed(state), mention_author=False)
 
     return bot
 
