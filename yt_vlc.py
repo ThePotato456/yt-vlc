@@ -29,6 +29,11 @@ YT_DLP_URL = (
     "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp.exe"
 )
 VLC_URL = "https://get.videolan.org/vlc/3.0.23/win64/vlc-3.0.23-win64.zip"
+DENO_VERSION = "2.8.1"
+DENO_URL = (
+    "https://github.com/denoland/deno/releases/download/"
+    f"v{DENO_VERSION}/deno-x86_64-pc-windows-msvc.zip"
+)
 CHUNK_SIZE = 256 * 1024
 METADATA_PREFIX = "__YTVLC_META__"
 METADATA_FIELDS = (
@@ -327,7 +332,7 @@ only at 720p or better, otherwise selecting separate video and audio up to
 1080p. Lower resolutions remain final compatibility fallbacks.
 
 On first use, pinned Windows executables are downloaded into ./bin. Existing
-files are reused; --yt-dlp and --vlc override the bundled executable paths.
+files are reused; --yt-dlp, --deno, and --vlc override the bundled paths.
 """
 
 
@@ -402,10 +407,34 @@ def extract_portable_vlc(archive: Path, destination: Path) -> None:
             extracted.replace(destination)
 
 
-def ensure_bundled_tools() -> tuple[Path, Path]:
-    """Create ./bin and install pinned yt-dlp and portable VLC if absent."""
+def extract_deno(archive: Path, destination: Path) -> None:
+    """Safely extract only deno.exe from the official release archive."""
+    with zipfile.ZipFile(archive) as package:
+        executables = [
+            member
+            for member in package.infolist()
+            if Path(member.filename).name.lower() == "deno.exe" and not member.is_dir()
+        ]
+        if len(executables) != 1:
+            raise RuntimeError(
+                f"Expected one deno.exe in the Deno archive, found {len(executables)}"
+            )
+
+        temporary = destination.with_name(f".{destination.name}.extract")
+        try:
+            with package.open(executables[0]) as source, temporary.open("wb") as output:
+                shutil.copyfileobj(source, output)
+            temporary.replace(destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
+
+def ensure_bundled_tools() -> tuple[Path, Path, Path]:
+    """Install pinned yt-dlp, Deno, and portable VLC under ./bin if absent."""
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     yt_dlp = BIN_DIR / "yt-dlp.exe"
+    deno = BIN_DIR / "deno.exe"
     vlc_directory = BIN_DIR / "vlc"
     vlc = vlc_directory / "vlc.exe"
 
@@ -413,6 +442,16 @@ def ensure_bundled_tools() -> tuple[Path, Path]:
         download(YT_DLP_URL, yt_dlp)
     else:
         live_status("OK", "yt-dlp is ready", "32")
+
+    if not deno.is_file():
+        with tempfile.TemporaryDirectory(prefix="yt-vlc-") as temporary_dir:
+            archive = Path(temporary_dir) / "deno.zip"
+            download(DENO_URL, archive)
+            live_status("...", "Extracting portable Deno", "33")
+            extract_deno(archive, deno)
+            live_status("OK", f"Deno {DENO_VERSION} is ready", "32")
+    else:
+        live_status("OK", "Deno is ready", "32")
 
     if not vlc.is_file():
         with tempfile.TemporaryDirectory(prefix="yt-vlc-") as temporary_dir:
@@ -424,7 +463,7 @@ def ensure_bundled_tools() -> tuple[Path, Path]:
     else:
         live_status("OK", "VLC is ready", "32")
 
-    return yt_dlp, vlc
+    return yt_dlp, vlc, deno
 
 
 def find_program(
@@ -459,7 +498,11 @@ def find_program(
 
 
 def resolve_streams(
-    yt_dlp: str, page_url: str, format_selector: str
+    yt_dlp: str,
+    page_url: str,
+    format_selector: str,
+    cookie_file: str | Path | None = None,
+    js_runtime: str | Path | None = None,
 ) -> tuple[list[str], dict[str, object]]:
     command = [
         yt_dlp,
@@ -469,9 +512,12 @@ def resolve_streams(
         format_selector,
         "--print",
         metadata_template(),
-        "-g",
-        page_url,
     ]
+    if js_runtime is not None:
+        command.extend(["--js-runtimes", f"deno:{Path(js_runtime).resolve()}"])
+    if cookie_file is not None:
+        command.extend(["--cookies", str(cookie_file)])
+    command.extend(["-g", page_url])
     with BrailleSpinner("Resolving media information"):
         result = subprocess.run(command, capture_output=True, text=True, check=False)
 
@@ -529,6 +575,11 @@ def parse_args() -> argparse.Namespace:
         help="yt-dlp format selector (default: combined 720p+ or up to 1080p)",
     )
     parser.add_argument("--yt-dlp", metavar="PATH", help="yt-dlp executable or path")
+    parser.add_argument(
+        "--deno",
+        metavar="PATH",
+        help="Deno executable or path for yt-dlp's YouTube challenge solver",
+    )
     parser.add_argument("--vlc", metavar="PATH", help="VLC executable or path")
     parser.add_argument(
         "--print-only",
@@ -551,12 +602,18 @@ def main() -> int:
 
         stage_count = 2 if args.print_only else 3
         live_status(f"1/{stage_count}", "Checking prerequisites")
-        bundled_yt_dlp, bundled_vlc = ensure_bundled_tools()
+        bundled_yt_dlp, bundled_vlc, bundled_deno = ensure_bundled_tools()
         yt_dlp = find_program("yt-dlp", args.yt_dlp, bundled_yt_dlp)
+        deno = find_program("deno", args.deno, bundled_deno)
 
         live_status(f"2/{stage_count}", "Resolving network streams")
         started = time.monotonic()
-        streams, media_info = resolve_streams(yt_dlp, page_url, args.format)
+        streams, media_info = resolve_streams(
+            yt_dlp,
+            page_url,
+            args.format,
+            js_runtime=deno,
+        )
         elapsed = time.monotonic() - started
         stream_description = (
             "separate video + audio" if len(streams) == 2 else "combined video/audio"

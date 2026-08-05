@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import unittest
-from unittest.mock import AsyncMock, PropertyMock, call, patch
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import discord
 
@@ -24,6 +27,7 @@ class FakeMessage:
 
 
 class FakeRequester:
+    id = 789
     mention = "@requester"
     display_name = "requester"
 
@@ -109,6 +113,304 @@ class FakeVLCSession:
 
 
 class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_vlc_warmup_starts_idle_reusable_session(self) -> None:
+        state = discord_bot.GuildState(guild_id=123)
+        session = MagicMock()
+        session.executable = "vlc.exe"
+        session.process.pid = 4321
+
+        with (
+            patch.object(
+                discord_bot,
+                "runtime_programs",
+                return_value=("yt-dlp.exe", "vlc.exe", "deno.exe"),
+            ),
+            patch.object(
+                discord_bot,
+                "VLCSession",
+                return_value=session,
+            ) as session_type,
+        ):
+            await discord_bot.warm_up_vlc(state)
+
+        session_type.assert_called_once_with("vlc.exe")
+        session.ensure_started.assert_called_once_with()
+        self.assertIs(state.vlc, session)
+
+    async def test_ready_event_warms_vlc_for_the_only_guild(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=None)
+        guild = FakeGuild()
+        with (
+            patch.object(
+                type(bot),
+                "user",
+                new_callable=PropertyMock,
+                return_value=SimpleNamespace(__str__=lambda _: "bot"),
+            ),
+            patch.object(
+                type(bot),
+                "guilds",
+                new_callable=PropertyMock,
+                return_value=[guild],
+            ),
+            patch.object(bot, "get_guild", return_value=guild),
+            patch.object(discord_bot, "warm_up_vlc", new=AsyncMock()) as warmup,
+        ):
+            await bot.on_ready()
+
+        state = discord_bot.GUILD_STATE.pop(guild.id)
+        warmup.assert_awaited_once_with(state)
+
+    def test_temporary_cookies_are_validated_and_filtered_for_site(self) -> None:
+        content = (
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tyoutube-secret\n"
+            ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tinstagram-secret\n"
+        ).encode()
+
+        prepared = discord_bot.prepare_temporary_cookies(
+            content,
+            "https://www.youtube.com/watch?v=example",
+        ).decode()
+
+        self.assertIn("youtube-secret", prepared)
+        self.assertNotIn("instagram-secret", prepared)
+
+    def test_youtube_short_urls_use_youtube_cookie_filter(self) -> None:
+        self.assertEqual(
+            discord_bot.cookie_target_for_url("https://youtu.be/HSpJOu73cvM"),
+            "youtube",
+        )
+
+    def test_unavailable_default_format_retries_with_flexible_selector(self) -> None:
+        cookie_path = Path("temporary-cookies.txt")
+        with patch.object(
+            yt_vlc,
+            "resolve_streams",
+            side_effect=[
+                RuntimeError("Requested format is not available"),
+                (["https://example.com/video", "https://example.com/audio"], {}),
+            ],
+        ) as resolve:
+            streams, _ = discord_bot.resolve_discord_streams(
+                "yt-dlp.exe",
+                "https://youtu.be/HSpJOu73cvM",
+                yt_vlc.DEFAULT_FORMAT,
+                cookie_file=cookie_path,
+                js_runtime="deno.exe",
+            )
+
+        self.assertEqual(len(streams), 2)
+        self.assertEqual(
+            [item.args[2] for item in resolve.call_args_list],
+            [yt_vlc.DEFAULT_FORMAT, discord_bot.FORMAT_AVAILABILITY_FALLBACK],
+        )
+        self.assertEqual(
+            [item.kwargs["cookie_file"] for item in resolve.call_args_list],
+            [cookie_path, cookie_path],
+        )
+        self.assertEqual(
+            [item.kwargs["js_runtime"] for item in resolve.call_args_list],
+            ["deno.exe", "deno.exe"],
+        )
+
+    def test_malformed_temporary_cookie_file_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            discord_bot.CookieFormatError,
+            "Netscape cookie format",
+        ):
+            discord_bot.prepare_temporary_cookies(
+                b"not a cookie file",
+                "https://www.youtube.com/watch?v=example",
+            )
+
+    def test_resolve_media_uses_and_removes_temporary_cookie_file(self) -> None:
+        observed_path: Path | None = None
+
+        def fake_resolve(
+            _yt_dlp: str,
+            _url: str,
+            _selector: str,
+            cookie_file: Path | None = None,
+            js_runtime: str | Path | None = None,
+        ) -> tuple[list[str], dict[str, object]]:
+            nonlocal observed_path
+            self.assertIsNotNone(cookie_file)
+            self.assertEqual(js_runtime, "deno.exe")
+            observed_path = Path(cookie_file)  # type: ignore[arg-type]
+            self.assertTrue(observed_path.is_file())
+            self.assertIn("youtube-secret", observed_path.read_text(encoding="utf-8"))
+            return ["https://example.com/stream"], {"title": "Private media"}
+
+        cookie_data = discord_bot.prepare_temporary_cookies(
+            (
+                "# Netscape HTTP Cookie File\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tyoutube-secret\n"
+            ).encode(),
+            "https://www.youtube.com/watch?v=example",
+        )
+        with (
+            patch.object(
+                yt_vlc,
+                "ensure_bundled_tools",
+                return_value=(
+                    Path("yt-dlp.exe"),
+                    Path("vlc.exe"),
+                    Path("deno.exe"),
+                ),
+            ),
+            patch.object(
+                yt_vlc,
+                "find_program",
+                side_effect=["yt-dlp.exe", "vlc.exe", "deno.exe"],
+            ),
+            patch.object(yt_vlc, "resolve_streams", side_effect=fake_resolve),
+        ):
+            media = discord_bot.resolve_media(
+                "https://www.youtube.com/watch?v=example",
+                cookie_data=cookie_data,
+            )
+
+        self.assertEqual(media.streams, ["https://example.com/stream"])
+        self.assertIsNotNone(observed_path)
+        self.assertFalse(observed_path.exists())  # type: ignore[union-attr]
+
+    def test_yt_dlp_resolution_receives_cookie_file_argument(self) -> None:
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout="https://example.com/stream\n",
+            stderr="",
+        )
+        with (
+            patch.object(yt_vlc, "BrailleSpinner", return_value=MagicMock()),
+            patch.object(
+                yt_vlc.subprocess,
+                "run",
+                return_value=completed,
+            ) as run,
+        ):
+            streams, _ = yt_vlc.resolve_streams(
+                "yt-dlp.exe",
+                "https://www.youtube.com/watch?v=private",
+                yt_vlc.DEFAULT_FORMAT,
+                cookie_file=Path("cookies.txt"),
+                js_runtime=Path("deno.exe"),
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(streams, ["https://example.com/stream"])
+        cookie_index = command.index("--cookies")
+        self.assertEqual(command[cookie_index + 1], "cookies.txt")
+        runtime_index = command.index("--js-runtimes")
+        self.assertEqual(
+            command[runtime_index + 1],
+            f"deno:{Path('deno.exe').resolve()}",
+        )
+
+    async def test_auth_failure_offers_requester_scoped_cookie_retry(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        message = FakeMessage()
+        state = discord_bot.GuildState(guild_id=123)
+        await state.queue.put(
+            discord_bot.MediaRequest(
+                url="https://www.youtube.com/watch?v=private",
+                requester=FakeRequester(),  # type: ignore[arg-type]
+                status_message=message,  # type: ignore[arg-type]
+                bot=bot,
+            )
+        )
+
+        with patch.object(
+            discord_bot,
+            "resolve_request_media",
+            side_effect=RuntimeError("Sign in to confirm you are not a bot"),
+        ):
+            worker = asyncio.create_task(discord_bot.run_guild_queue(state))
+            try:
+                await asyncio.wait_for(state.queue.join(), timeout=1)
+            finally:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
+        retry_view = message.edits[-1]["view"]
+        self.assertIsInstance(retry_view, discord_bot.CookieRetryView)
+        self.assertIn("temporary cookies.txt", message.edits[-1]["content"])
+        retry_view.stop()
+
+    async def test_cookie_retry_upload_is_deleted_filtered_and_requeued(self) -> None:
+        state = discord_bot.GuildState(guild_id=123)
+        status_message = FakeMessage()
+        upload_channel = SimpleNamespace(id=999, send=AsyncMock())
+        requester = SimpleNamespace(
+            id=789,
+            mention="@requester",
+            display_name="requester",
+            create_dm=AsyncMock(return_value=upload_channel),
+        )
+        cookie_content = (
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tyoutube-secret\n"
+            ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tother-secret\n"
+        ).encode()
+        attachment = SimpleNamespace(
+            filename="cookies.txt",
+            size=len(cookie_content),
+            read=AsyncMock(return_value=cookie_content),
+        )
+        upload_message = SimpleNamespace(
+            author=requester,
+            channel=upload_channel,
+            attachments=[attachment],
+            delete=AsyncMock(),
+        )
+        bot = SimpleNamespace(wait_for=AsyncMock(return_value=upload_message))
+        request = discord_bot.MediaRequest(
+            url="https://www.youtube.com/watch?v=private",
+            requester=requester,  # type: ignore[arg-type]
+            status_message=status_message,  # type: ignore[arg-type]
+            bot=bot,  # type: ignore[arg-type]
+        )
+        view = discord_bot.CookieRetryView(bot, state, request)  # type: ignore[arg-type]
+        interaction = SimpleNamespace(
+            user=requester,
+            guild=SimpleNamespace(id=123),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        with patch.object(discord_bot, "ensure_guild_worker") as ensure_worker:
+            await view.handle_temporary_cookie_retry(interaction)  # type: ignore[arg-type]
+
+        retried = state.queue.get_nowait()
+        state.queue.task_done()
+        self.assertIsNotNone(retried.cookie_data)
+        prepared = retried.cookie_data.decode()  # type: ignore[union-attr]
+        self.assertIn("youtube-secret", prepared)
+        self.assertNotIn("other-secret", prepared)
+        upload_message.delete.assert_awaited_once_with()
+        ensure_worker.assert_called_once_with(state)
+        self.assertIsNone(status_message.edits[-1]["view"])
+        view.stop()
+
+    def test_log_formatter_redacts_private_links_only(self) -> None:
+        sensitive = "https://nexus-220.cnam.tb-cdn.io/file?token=secret"
+        youtube = "https://www.youtube.com/watch?v=public-video"
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg=f"private={sensitive} public={youtube}",
+            args=(),
+            exc_info=None,
+        )
+
+        rendered = discord_bot.RedactingFormatter("%(message)s").format(record)
+
+        self.assertNotIn("secret", rendered)
+        self.assertIn(discord_bot.REDACTED_LINK, rendered)
+        self.assertIn(youtube, rendered)
+
     def test_default_format_rejects_low_resolution_combined_streams(self) -> None:
         self.assertEqual(
             yt_vlc.DEFAULT_FORMAT,
@@ -387,6 +689,95 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(session.process)
         self.assertIsNone(session.process.poll())
+
+    def test_vlc_readiness_tolerates_delayed_http_startup(self) -> None:
+        process = MagicMock()
+        process.poll.return_value = None
+        session = discord_bot.VLCSession("vlc.exe")
+        session.process = process
+
+        with (
+            patch.object(
+                session,
+                "status",
+                side_effect=[ConnectionRefusedError(), {"state": "stopped"}],
+            ) as status,
+            patch.object(discord_bot.time, "sleep") as sleep,
+        ):
+            session._wait_until_ready()
+
+        self.assertEqual(status.call_count, 2)
+        sleep.assert_called_once_with(discord_bot.VLC_START_POLL_INTERVAL)
+        process.terminate.assert_not_called()
+
+    def test_vlc_launch_uses_directsound_for_discord_capture(self) -> None:
+        process = MagicMock()
+        process.pid = 1234
+        with (
+            patch.dict(
+                discord_bot.os.environ,
+                {"VLC_AUDIO_OUTPUT": "directsound"},
+            ),
+            patch.object(
+                discord_bot.VLCSession,
+                "_available_port",
+                return_value=4567,
+            ),
+            patch.object(
+                discord_bot.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+        ):
+            session = discord_bot.VLCSession("vlc.exe")
+            session._launch()
+
+        command = popen.call_args.args[0]
+        self.assertIn("--aout=directsound", command)
+
+    def test_automatic_vlc_audio_output_omits_module_override(self) -> None:
+        with patch.dict(
+            discord_bot.os.environ,
+            {"VLC_AUDIO_OUTPUT": "automatic"},
+        ):
+            self.assertIsNone(discord_bot.configured_vlc_audio_output())
+
+    def test_invalid_vlc_audio_output_is_rejected(self) -> None:
+        with patch.dict(
+            discord_bot.os.environ,
+            {"VLC_AUDIO_OUTPUT": "not-a-module"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "VLC_AUDIO_OUTPUT"):
+                discord_bot.configured_vlc_audio_output()
+
+    def test_vlc_initialization_relaunches_failed_controller(self) -> None:
+        first_process = MagicMock()
+        first_process.poll.return_value = None
+        second_process = MagicMock()
+        second_process.poll.return_value = None
+        processes = iter((first_process, second_process))
+        session = discord_bot.VLCSession("vlc.exe")
+
+        def fake_launch() -> None:
+            session.process = next(processes)
+
+        with (
+            patch.object(session, "_launch", side_effect=fake_launch) as launch,
+            patch.object(
+                session,
+                "_wait_until_ready",
+                side_effect=[RuntimeError("controller unavailable"), None],
+            ),
+        ):
+            session.ensure_started()
+
+        self.assertEqual(launch.call_count, 2)
+        first_process.terminate.assert_called_once_with()
+        first_process.wait.assert_called_once_with(
+            timeout=discord_bot.VLC_SHUTDOWN_TIMEOUT
+        )
+        second_process.terminate.assert_not_called()
+        self.assertIs(session.process, second_process)
 
     def test_separate_audio_is_sent_as_an_input_slave(self) -> None:
         session = discord_bot.VLCSession("vlc.exe")
