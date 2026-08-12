@@ -140,8 +140,25 @@ Playback commands:
 | `!pause` | Pause the current item |
 | `!resume` | Resume the paused item |
 | `!skip`, `!s` | Stop the current item and advance to the next request |
+| `!seek <[+/-]seconds\|[+/-]MM:SS\|[+/-]HH:MM:SS>` | Seek absolutely, or move relative to the current time with `+`/`-` |
 | `!stop` | Stop playback and clear pending requests without closing VLC |
-| `!queue`, `!q` | Show the current item and pending URLs in an embed |
+| `!queue`, `!q` | Show bot requests plus VLC's live playlist and active item |
+
+Seek positions may be written as raw seconds (`!seek 90`), minutes and seconds
+(`!seek 01:30`), or hours, minutes, and seconds (`!seek 1:02:30`). Seeking
+beyond the current media duration is rejected. Prefix a value with `+` to move
+forward from the current playback time, such as `!seek +10`, `!seek +60`, or
+`!seek +05:00`. Prefix it with `-` to rewind, such as `!seek -10`, `!seek -60`,
+or `!seek -05:00`. Rewinding past the beginning lands at `0:00`. Values without
+a modifier remain absolute positions. `!skip` retains its queue-control behavior
+and always advances to the next request.
+
+`!queue` reads both the bot's lazy request queue and VLC's own live playlist.
+Files or network media added manually through VLC therefore appear even when
+they did not originate from `!play`, and VLC's actual active item is marked
+**Now playing**. Local folder paths and raw signed stream URLs are not exposed
+in Discord. `!seek` also operates on VLC's actual active item, so manually
+added files do not need a corresponding bot request.
 
 The commands work in the configured server and in direct messages from the
 Discord application owner. DM commands from every other account are rejected.

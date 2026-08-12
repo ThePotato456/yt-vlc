@@ -589,6 +589,88 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret-token", embed.description)
         self.assertIn(discord_bot.REDACTED_LINK, embed.description)
 
+    def test_vlc_playlist_reads_items_added_outside_bot_queue(self) -> None:
+        session = discord_bot.VLCSession("vlc.exe")
+        with (
+            patch.object(session, "is_running", return_value=True),
+            patch.object(
+                session,
+                "status",
+                return_value={"state": "playing", "currentplid": 7},
+            ),
+            patch.object(
+                session,
+                "_json_request",
+                return_value={
+                    "children": [
+                        {
+                            "name": "Playlist",
+                            "children": [
+                                {
+                                    "id": "7",
+                                    "name": "Manually opened movie",
+                                    "uri": "file:///C:/private/path/movie.mkv",
+                                    "duration": 300,
+                                    "type": "leaf",
+                                },
+                                {
+                                    "id": "8",
+                                    "name": "Next external item",
+                                    "uri": "https://example.com/media",
+                                    "duration": 90,
+                                    "type": "leaf",
+                                },
+                            ],
+                        }
+                    ]
+                },
+            ) as request,
+        ):
+            items = session.playlist()
+
+        request.assert_called_once_with("playlist.json")
+        self.assertEqual([item.title for item in items], [
+            "Manually opened movie",
+            "Next external item",
+        ])
+        self.assertTrue(items[0].current)
+        self.assertFalse(items[1].current)
+
+    async def test_queue_command_includes_live_vlc_playlist(self) -> None:
+        state = discord_bot.GuildState(guild_id=123)
+        state.vlc = MagicMock()
+        state.vlc.is_running.return_value = True
+        state.vlc.playlist.return_value = [
+            discord_bot.VLCPlaylistItem(
+                item_id="7",
+                title="Manually opened movie",
+                duration=300,
+                current=True,
+            ),
+            discord_bot.VLCPlaylistItem(
+                item_id="8",
+                title="Next external item",
+                duration=90,
+                current=False,
+            ),
+        ]
+        discord_bot.GUILD_STATE[123] = state
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        context = FakeContext()
+
+        try:
+            command = bot.get_command("queue")
+            self.assertIsNotNone(command)
+            await command.callback(context)  # type: ignore[arg-type, union-attr]
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        embed = context.reply_options[-1]["embed"]
+        self.assertIn("VLC playlist", embed.description)
+        self.assertIn("▶ Now playing", embed.description)
+        self.assertIn("Manually opened movie", embed.description)
+        self.assertIn("Next external item", embed.description)
+
     async def test_only_the_bot_owner_can_use_dm_commands(self) -> None:
         bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
         command = bot.get_command("queue")
@@ -666,6 +748,23 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(bot.get_command("p"), bot.get_command("play"))
         self.assertIs(bot.get_command("s"), bot.get_command("skip"))
         self.assertIs(bot.get_command("q"), bot.get_command("queue"))
+
+    def test_seek_positions_accept_seconds_and_clock_formats(self) -> None:
+        self.assertEqual(discord_bot.parse_seek_position("90"), 90)
+        self.assertEqual(discord_bot.parse_seek_position("01:30"), 90)
+        self.assertEqual(discord_bot.parse_seek_position("1:02:30"), 3750)
+        self.assertEqual(discord_bot.parse_seek_expression("+10"), (10, True))
+        self.assertEqual(discord_bot.parse_seek_expression("+60"), (60, True))
+        self.assertEqual(discord_bot.parse_seek_expression("+05:00"), (300, True))
+        self.assertEqual(discord_bot.parse_seek_expression("-10"), (-10, True))
+        self.assertEqual(discord_bot.parse_seek_expression("-05:00"), (-300, True))
+        self.assertEqual(discord_bot.parse_seek_expression("05:00"), (300, False))
+
+    def test_seek_positions_reject_invalid_clock_values(self) -> None:
+        for value in ("", "+", "-", "1:60", "1:60:00", "1:2:3:4", "soon"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    discord_bot.parse_seek_position(value)
 
     async def test_playback_end_does_not_close_vlc_process(self) -> None:
         class RunningProcess:
@@ -842,6 +941,164 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertIsNone(session.process.poll())
+
+    def test_vlc_seek_uses_absolute_seconds_without_closing_player(self) -> None:
+        class RunningProcess:
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+        session = discord_bot.VLCSession("vlc.exe")
+        session.process = RunningProcess()  # type: ignore[assignment]
+        with patch.object(
+            session,
+            "_request",
+            side_effect=[
+                {"state": "playing", "time": 20, "length": 300},
+                {"state": "playing", "time": 90, "length": 300},
+            ],
+        ) as request:
+            result = session.seek_when_ready(90)
+
+        self.assertEqual(result["time"], 90)
+        self.assertEqual(
+            request.call_args_list,
+            [call(), call({"command": "seek", "val": "90S"})],
+        )
+        self.assertIsNone(session.process.poll())
+
+    def test_vlc_relative_seek_adds_to_current_playback_time(self) -> None:
+        class RunningProcess:
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+        session = discord_bot.VLCSession("vlc.exe")
+        session.process = RunningProcess()  # type: ignore[assignment]
+        with patch.object(
+            session,
+            "_request",
+            side_effect=[
+                {"state": "playing", "time": 75, "length": 300},
+                {"state": "playing", "time": 135, "length": 300},
+            ],
+        ) as request:
+            target = session.seek_relative_when_ready(60)
+
+        self.assertEqual(target, 135)
+        self.assertEqual(
+            request.call_args_list,
+            [call(), call({"command": "seek", "val": "135S"})],
+        )
+
+    def test_vlc_relative_seek_rewinds_and_clamps_at_start(self) -> None:
+        class RunningProcess:
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+        session = discord_bot.VLCSession("vlc.exe")
+        session.process = RunningProcess()  # type: ignore[assignment]
+        with patch.object(
+            session,
+            "_request",
+            side_effect=[
+                {"state": "playing", "time": 20, "length": 300},
+                {"state": "playing", "time": 0, "length": 300},
+            ],
+        ) as request:
+            target = session.seek_relative_when_ready(-60)
+
+        self.assertEqual(target, 0)
+        self.assertEqual(
+            request.call_args_list,
+            [call(), call({"command": "seek", "val": "0S"})],
+        )
+
+    async def test_seek_command_moves_current_playback(self) -> None:
+        state = discord_bot.GuildState(guild_id=123)
+        state.current = discord_bot.MediaRequest(
+            url="https://example.com/current",
+            requester=FakeRequester(),  # type: ignore[arg-type]
+            status_message=FakeMessage(),  # type: ignore[arg-type]
+        )
+        state.vlc = MagicMock()
+        state.vlc.is_running.return_value = True
+        state.vlc.seek_when_ready.return_value = {
+            "state": "playing",
+            "time": 90,
+            "length": 300,
+        }
+        discord_bot.GUILD_STATE[123] = state
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        context = FakeContext()
+
+        try:
+            command = bot.get_command("seek")
+            self.assertIsNotNone(command)
+            await command.callback(  # type: ignore[arg-type, union-attr]
+                context,
+                position="01:30",
+            )
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        state.vlc.seek_when_ready.assert_called_once_with(90)
+        self.assertEqual(context.replies[-1], "Playback moved to `1:30`.")
+
+    async def test_seek_command_controls_manually_added_vlc_media(self) -> None:
+        state = discord_bot.GuildState(guild_id=123)
+        state.vlc = MagicMock()
+        state.vlc.is_running.return_value = True
+        state.vlc.seek_relative_when_ready.return_value = 135
+        discord_bot.GUILD_STATE[123] = state
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        context = FakeContext()
+
+        try:
+            command = bot.get_command("seek")
+            self.assertIsNotNone(command)
+            await command.callback(  # type: ignore[arg-type, union-attr]
+                context,
+                position="+60",
+            )
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        state.vlc.seek_relative_when_ready.assert_called_once_with(60)
+        state.vlc.seek_when_ready.assert_not_called()
+        self.assertEqual(
+            context.replies[-1],
+            "Playback advanced by `1:00` to `2:15`.",
+        )
+
+    async def test_seek_command_minus_modifier_rewinds_playback(self) -> None:
+        state = discord_bot.GuildState(guild_id=123)
+        state.vlc = MagicMock()
+        state.vlc.is_running.return_value = True
+        state.vlc.seek_relative_when_ready.return_value = 75
+        discord_bot.GUILD_STATE[123] = state
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        context = FakeContext()
+
+        try:
+            command = bot.get_command("seek")
+            self.assertIsNotNone(command)
+            await command.callback(  # type: ignore[arg-type, union-attr]
+                context,
+                position="-60",
+            )
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        state.vlc.seek_relative_when_ready.assert_called_once_with(-60)
+        self.assertEqual(
+            context.replies[-1],
+            "Playback rewound by `1:00` to `1:15`.",
+        )
 
     async def test_stop_clears_pending_requests_and_keeps_vlc(self) -> None:
         state = discord_bot.GuildState(guild_id=123)

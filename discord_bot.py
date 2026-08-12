@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
@@ -135,6 +135,14 @@ class PreparedMedia:
     info: dict[str, object]
 
 
+@dataclass(slots=True, frozen=True)
+class VLCPlaylistItem:
+    item_id: str
+    title: str
+    duration: float | None
+    current: bool
+
+
 @dataclass(slots=True)
 class PrefetchedRequest:
     request: MediaRequest
@@ -159,6 +167,62 @@ def status_number(status: dict[str, object], key: str) -> float | None:
     except (KeyError, TypeError, ValueError):
         return None
     return value if math.isfinite(value) and value >= 0 else None
+
+
+def parse_seek_expression(value: str) -> tuple[int, bool]:
+    """Parse a seek expression and report whether it is relative."""
+    text = value.strip()
+    if not text:
+        raise ValueError("provide a seek position")
+    relative = text.startswith(("+", "-"))
+    direction = -1 if text.startswith("-") else 1
+    if relative:
+        text = text[1:]
+        if not text:
+            raise ValueError("provide a time after the + or - modifier")
+
+    parts = text.split(":")
+    if len(parts) == 1:
+        if not parts[0].isdigit():
+            raise ValueError("use seconds, MM:SS, or HH:MM:SS")
+        return direction * int(parts[0]), relative
+    if len(parts) not in {2, 3} or any(not part.isdigit() for part in parts):
+        raise ValueError("use seconds, MM:SS, or HH:MM:SS")
+
+    numbers = [int(part) for part in parts]
+    if numbers[-1] >= 60 or (len(numbers) == 3 and numbers[-2] >= 60):
+        raise ValueError("minutes and seconds must be below 60")
+    if len(numbers) == 2:
+        minutes, seconds = numbers
+        return direction * (minutes * 60 + seconds), relative
+    hours, minutes, seconds = numbers
+    return direction * (hours * 3600 + minutes * 60 + seconds), relative
+
+
+def parse_seek_position(value: str) -> int:
+    """Parse a seek expression into seconds, ignoring absolute/relative mode."""
+    return parse_seek_expression(value)[0]
+
+
+def vlc_playlist_title(name: object, uri: object) -> str:
+    """Render a useful VLC title without exposing paths or signed stream URLs."""
+    title = str(name).strip() if isinstance(name, str) else ""
+    source = str(uri).strip() if isinstance(uri, str) else ""
+    candidate = title or source
+    candidate = " ".join(candidate.split())
+    parsed = urlparse(candidate)
+    if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+        if is_sensitive_link(candidate):
+            return REDACTED_LINK
+        return f"{parsed.hostname or 'Network'} media"
+    if parsed.scheme.lower() == "file":
+        filename = parsed.path.rstrip("/").replace("\\", "/").rsplit("/", 1)[-1]
+        return filename or "Local media"
+    if re.match(r"^[a-zA-Z]:[\\/]", candidate):
+        return candidate.replace("\\", "/").rsplit("/", 1)[-1] or "Local media"
+
+    candidate = redact_sensitive_links(candidate) or "VLC media"
+    return f"{candidate[:157]}..." if len(candidate) > 160 else candidate
 
 
 def configured_vlc_audio_output() -> str | None:
@@ -193,10 +257,14 @@ class VLCSession:
         credentials = base64.b64encode(f":{self.password}".encode("utf-8"))
         return f"Basic {credentials.decode('ascii')}"
 
-    def _request(self, params: dict[str, str] | None = None) -> dict[str, object]:
+    def _json_request(
+        self,
+        endpoint: str,
+        params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
         query = f"?{urlencode(params)}" if params else ""
         request = Request(
-            f"http://127.0.0.1:{self.port}/requests/status.json{query}",
+            f"http://127.0.0.1:{self.port}/requests/{endpoint}{query}",
             headers={"Authorization": self._authorization()},
         )
         with urlopen(request, timeout=2) as response:
@@ -205,8 +273,49 @@ class VLCSession:
             raise RuntimeError("VLC returned an invalid status response")
         return result
 
+    def _request(self, params: dict[str, str] | None = None) -> dict[str, object]:
+        return self._json_request("status.json", params)
+
     def status(self) -> dict[str, object]:
         return self._request()
+
+    def playlist(self) -> list[VLCPlaylistItem]:
+        """Return VLC's live playlist, including items added outside the bot."""
+        if not self.is_running():
+            return []
+        status = self.status()
+        current_id = str(status.get("currentplid", ""))
+        payload = self._json_request("playlist.json")
+        items: list[VLCPlaylistItem] = []
+
+        def walk(value: object) -> None:
+            if isinstance(value, list):
+                for child in value:
+                    walk(child)
+                return
+            if not isinstance(value, dict):
+                return
+
+            children = value.get("children")
+            item_id = str(value.get("id", ""))
+            uri = value.get("uri")
+            if value.get("type") == "leaf" or isinstance(uri, str):
+                raw_duration = status_number(value, "duration")
+                items.append(
+                    VLCPlaylistItem(
+                        item_id=item_id,
+                        title=vlc_playlist_title(value.get("name"), uri),
+                        duration=raw_duration,
+                        current=(
+                            bool(current_id and item_id == current_id)
+                            or str(value.get("current", "")).lower() == "current"
+                        ),
+                    )
+                )
+            walk(children)
+
+        walk(payload)
+        return items
 
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -356,7 +465,12 @@ class VLCSession:
         LOGGER.info("Stopping current VLC item; player process remains open")
         return self._request({"command": "pl_stop"})
 
-    def seek_when_ready(self, seconds: float) -> dict[str, object]:
+    def _seek_when_ready(
+        self,
+        seconds: float,
+        *,
+        relative: bool,
+    ) -> tuple[dict[str, object], int]:
         if not self.is_running():
             raise RuntimeError("VLC is not running")
         deadline = time.monotonic() + VLC_PLAYBACK_TIMEOUT
@@ -364,13 +478,42 @@ class VLCSession:
             status = self.status()
             state_name = str(status.get("state", "")).lower()
             if state_name in {"playing", "paused"}:
-                return self._request(
-                    {"command": "seek", "val": f"{max(0, round(seconds))}S"}
+                target = seconds
+                if relative:
+                    current = status_number(status, "time")
+                    if current is None:
+                        raise RuntimeError("VLC did not report its current playback time")
+                    target = current + seconds
+                length = status_number(status, "length")
+                if length is not None and length > 0 and target > length:
+                    duration = yt_vlc.human_duration(length)
+                    raise ValueError(
+                        f"seek position exceeds the media duration ({duration})"
+                    )
+                rounded_target = max(0, round(target))
+                LOGGER.info(
+                    "Seeking VLC playback to %s relative=%s",
+                    yt_vlc.human_duration(rounded_target),
+                    relative,
                 )
+                result = self._request(
+                    {"command": "seek", "val": f"{rounded_target}S"}
+                )
+                return result, rounded_target
             if not self.is_running():
                 raise RuntimeError("VLC closed before playback could resume")
             time.sleep(0.1)
         raise RuntimeError("VLC did not become ready to resume playback")
+
+    def seek_when_ready(self, seconds: float) -> dict[str, object]:
+        """Seek to an absolute media position once VLC is ready."""
+        result, _ = self._seek_when_ready(seconds, relative=False)
+        return result
+
+    def seek_relative_when_ready(self, seconds: float) -> int:
+        """Move from VLC's current time and return the absolute destination."""
+        _, target = self._seek_when_ready(seconds, relative=True)
+        return target
 
     async def wait_until_finished(
         self,
@@ -1056,7 +1199,18 @@ def queue_line(request: MediaRequest, label: str) -> str:
     return f"**{label}** {rendered_url} — {request.requester.mention}"
 
 
-def queue_embed(state: GuildState | None) -> discord.Embed:
+def vlc_playlist_line(item: VLCPlaylistItem, position: int) -> str:
+    marker = "▶ Now playing" if item.current else str(position)
+    title = discord.utils.escape_markdown(item.title)
+    duration = yt_vlc.human_duration(item.duration)
+    duration_note = f" · `{duration}`" if duration else ""
+    return f"**{marker}** {title}{duration_note}"
+
+
+def queue_embed(
+    state: GuildState | None,
+    vlc_items: Sequence[VLCPlaylistItem] = (),
+) -> discord.Embed:
     current = state.current if state is not None else None
     queued = pending_requests(state) if state is not None else ()
     entries: list[tuple[MediaRequest, str]] = []
@@ -1068,16 +1222,39 @@ def queue_embed(state: GuildState | None) -> discord.Embed:
     )
 
     lines: list[str] = []
+    if entries:
+        lines.append("**Bot requests**")
     for request, label in entries:
         line = queue_line(request, label)
         candidate = "\n".join((*lines, line))
-        if len(candidate) > MAX_QUEUE_EMBED_DESCRIPTION - 40:
+        if len(candidate) > MAX_QUEUE_EMBED_DESCRIPTION - 100:
             break
         lines.append(line)
 
     omitted = len(entries) - len(lines)
+    if entries:
+        omitted += 1  # Do not count the section heading as a rendered request.
     if omitted:
         lines.append(f"*...and {omitted} more request{'s' if omitted != 1 else ''}.*")
+
+    rendered_vlc = 0
+    if vlc_items:
+        section = "\n**VLC playlist**" if lines else "**VLC playlist**"
+        if len("\n".join((*lines, section))) <= MAX_QUEUE_EMBED_DESCRIPTION - 100:
+            lines.append(section)
+            for position, item in enumerate(vlc_items, start=1):
+                line = vlc_playlist_line(item, position)
+                candidate = "\n".join((*lines, line))
+                if len(candidate) > MAX_QUEUE_EMBED_DESCRIPTION - 100:
+                    break
+                lines.append(line)
+                rendered_vlc += 1
+        omitted_vlc = len(vlc_items) - rendered_vlc
+        if omitted_vlc:
+            lines.append(
+                f"*...and {omitted_vlc} more VLC item"
+                f"{'s' if omitted_vlc != 1 else ''}.*"
+            )
 
     description = (
         "\n".join(lines)
@@ -1090,10 +1267,13 @@ def queue_embed(state: GuildState | None) -> discord.Embed:
         color=0xF26B38,
     )
     pending_count = len(queued)
+    vlc_count = len(vlc_items)
     embed.set_footer(
         text=(
             f"{pending_count} pending request"
             f"{'s' if pending_count != 1 else ''}"
+            f" · {vlc_count} VLC playlist item"
+            f"{'s' if vlc_count != 1 else ''}"
         )
     )
     return embed
@@ -1529,6 +1709,82 @@ def build_bot(
                 mention_author=False,
             )
 
+    @bot.command(name="seek")
+    async def seek_command(
+        ctx: commands.Context[commands.Bot],
+        *,
+        position: str,
+    ) -> None:
+        """Seek absolutely, or move relative with a leading + or -."""
+        if not await allowed_context(ctx):
+            return
+        try:
+            seconds, relative = parse_seek_expression(position)
+        except ValueError as error:
+            await ctx.reply(
+                f"Invalid seek position: {error}. "
+                f"Usage: `{COMMAND_PREFIX}seek <[+/-]seconds|[+/-]MM:SS|[+/-]HH:MM:SS>`",
+                mention_author=False,
+            )
+            return
+
+        state = GUILD_STATE.get(target_guild_id(ctx))
+        if (
+            state is None
+            or state.vlc is None
+            or not state.vlc.is_running()
+        ):
+            await ctx.reply("Nothing is currently playing.", mention_author=False)
+            return
+        try:
+            if relative:
+                target = await asyncio.to_thread(
+                    state.vlc.seek_relative_when_ready,
+                    seconds,
+                )
+            else:
+                await asyncio.to_thread(state.vlc.seek_when_ready, seconds)
+                target = seconds
+            rendered = yt_vlc.human_duration(target) or "0:00"
+            LOGGER.info(
+                "Seek requested guild=%s requester=%s position=%s relative=%s",
+                state.guild_id,
+                getattr(ctx.author, "id", "unknown"),
+                rendered,
+                relative,
+            )
+            await ctx.reply(
+                (
+                    f"Playback {'advanced' if seconds >= 0 else 'rewound'} by "
+                    f"`{yt_vlc.human_duration(abs(seconds)) or '0:00'}` "
+                    f"to `{rendered}`."
+                    if relative
+                    else f"Playback moved to `{rendered}`."
+                ),
+                mention_author=False,
+            )
+        except Exception as error:
+            LOGGER.exception("Seek command failed guild=%s", state.guild_id)
+            await ctx.reply(
+                f"Could not seek VLC: {str(error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+
+    @seek_command.error
+    async def seek_error(
+        ctx: commands.Context[commands.Bot],
+        error: commands.CommandError,
+    ) -> None:
+        if not await allowed_context(ctx):
+            return
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.reply(
+                f"Usage: `{COMMAND_PREFIX}seek <[+/-]seconds|[+/-]MM:SS|[+/-]HH:MM:SS>`",
+                mention_author=False,
+            )
+            return
+        raise error
+
     @bot.command(name="stop")
     async def stop_command(ctx: commands.Context[commands.Bot]) -> None:
         """Stop playback, clear pending requests, and leave VLC open."""
@@ -1587,11 +1843,23 @@ def build_bot(
 
     @bot.command(name="queue", aliases=["q"])
     async def queue_command(ctx: commands.Context[commands.Bot]) -> None:
-        """Show the current item and unresolved pending URLs."""
+        """Show bot requests and VLC items, including externally added media."""
         if not await allowed_context(ctx):
             return
         state = GUILD_STATE.get(target_guild_id(ctx))
-        await ctx.reply(embed=queue_embed(state), mention_author=False)
+        vlc_items: list[VLCPlaylistItem] = []
+        if state is not None and state.vlc is not None and state.vlc.is_running():
+            try:
+                vlc_items = await asyncio.to_thread(state.vlc.playlist)
+            except (OSError, RuntimeError, ValueError):
+                LOGGER.exception(
+                    "Could not read VLC playlist for queue command guild=%s",
+                    state.guild_id,
+                )
+        await ctx.reply(
+            embed=queue_embed(state, vlc_items),
+            mention_author=False,
+        )
 
     return bot
 
