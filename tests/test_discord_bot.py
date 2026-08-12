@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -89,6 +91,7 @@ class FakeVLCSession:
         self,
         _: dict[str, object],
         on_near_end: object = None,
+        should_stop_waiting: object = None,
     ) -> None:
         current = self.played[-1]
         if (
@@ -458,6 +461,7 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
                 self,
                 _: dict[str, object],
                 on_near_end: object = None,
+                should_stop_waiting: object = None,
             ) -> None:
                 self.wait_calls += 1
                 if self.wait_calls == 1:
@@ -748,6 +752,9 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(bot.get_command("p"), bot.get_command("play"))
         self.assertIs(bot.get_command("s"), bot.get_command("skip"))
         self.assertIs(bot.get_command("q"), bot.get_command("queue"))
+        self.assertIs(bot.get_command("clearplaylist"), bot.get_command("clear"))
+        self.assertIs(bot.get_command("localqueue"), bot.get_command("local"))
+        self.assertIs(bot.get_command("media"), bot.get_command("local"))
 
     def test_seek_positions_accept_seconds_and_clock_formats(self) -> None:
         self.assertEqual(discord_bot.parse_seek_position("90"), 90)
@@ -765,6 +772,130 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     discord_bot.parse_seek_position(value)
+
+    def test_local_folder_media_is_recursive_filtered_and_sorted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "media"
+            album = root / "Album"
+            album.mkdir(parents=True)
+            (root / "z-last.mp4").write_bytes(b"video")
+            (album / "a-first.flac").write_bytes(b"audio")
+            (album / "notes.txt").write_text("ignored", encoding="utf-8")
+            outside = Path(temporary) / "outside.mp4"
+            outside.write_bytes(b"outside")
+
+            with patch.object(discord_bot, "MEDIA_DIR", root):
+                files = discord_bot.local_folder_media(root)
+                labels = [discord_bot.local_media_label(path) for path in files]
+                with self.assertRaisesRegex(ValueError, "escapes"):
+                    discord_bot.resolve_local_media_path(outside, directory=False)
+
+        self.assertEqual(
+            labels,
+            ["media/Album/a-first.flac", "media/z-last.mp4"],
+        )
+
+    def test_local_media_resolution_bypasses_ytdlp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "media"
+            root.mkdir()
+            media_file = root / "movie.mkv"
+            media_file.write_bytes(b"local-video")
+            request = discord_bot.MediaRequest(
+                url="local:media/movie.mkv",
+                requester=FakeRequester(),  # type: ignore[arg-type]
+                status_message=FakeMessage(),  # type: ignore[arg-type]
+                local_path=media_file,
+            )
+
+            with (
+                patch.object(discord_bot, "MEDIA_DIR", root),
+                patch.object(
+                    discord_bot,
+                    "runtime_programs",
+                    return_value=("yt-dlp.exe", "vlc.exe", "deno.exe"),
+                ),
+                patch.object(discord_bot, "resolve_media") as resolve_remote,
+            ):
+                prepared = discord_bot.resolve_request_media(request)
+
+        resolve_remote.assert_not_called()
+        self.assertEqual(prepared.vlc, "vlc.exe")
+        self.assertEqual(prepared.info["title"], "movie.mkv")
+        self.assertTrue(prepared.info["_local_media"])
+
+    async def test_local_command_opens_requester_scoped_media_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "media"
+            root.mkdir()
+            (root / "movie.mp4").write_bytes(b"video")
+            (root / "ignore.txt").write_text("ignored", encoding="utf-8")
+            bot = discord_bot.build_bot(
+                request_channel_id=None,
+                configured_guild_id=123,
+            )
+            context = FakeContext()
+
+            with patch.object(discord_bot, "MEDIA_DIR", root):
+                command = bot.get_command("local")
+                self.assertIsNotNone(command)
+                await command.callback(context)  # type: ignore[arg-type, union-attr]
+                view = context.reply_options[-1]["view"]
+
+            self.assertIsInstance(view, discord_bot.LocalMediaBrowserView)
+            labels = [option.label for option in view.selector.options]
+            self.assertIn("Queue this folder recursively", labels)
+            self.assertIn("movie.mp4", labels)
+            self.assertNotIn("ignore.txt", labels)
+            self.assertEqual(view.requester.id, FakeRequester.id)
+            view.stop()
+            discord_bot.GUILD_STATE.pop(123, None)
+
+    async def test_local_browser_appends_an_entire_folder_to_vlc_playlist(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "media"
+            folder = root / "Shows"
+            folder.mkdir(parents=True)
+            first = folder / "01.mkv"
+            second = folder / "02.mp4"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            bot = discord_bot.build_bot(
+                request_channel_id=None,
+                configured_guild_id=123,
+            )
+            state = discord_bot.GuildState(guild_id=123)
+            state.vlc = MagicMock()
+            state.vlc.enqueue_local_inputs.return_value = (3, False)
+            message = FakeMessage()
+            interaction = SimpleNamespace(
+                message=message,
+                response=SimpleNamespace(defer=AsyncMock()),
+                edit_original_response=AsyncMock(),
+            )
+
+            with patch.object(discord_bot, "MEDIA_DIR", root):
+                view = discord_bot.LocalMediaBrowserView(
+                    bot,
+                    state,
+                    FakeRequester(),  # type: ignore[arg-type]
+                )
+                view.current = folder
+                view.refresh()
+                await view.handle_selection(  # type: ignore[arg-type]
+                    interaction,
+                    "queue-folder",
+                )
+
+            state.vlc.enqueue_local_inputs.assert_called_once_with([folder])
+            self.assertEqual(state.queue.qsize(), 0)
+            interaction.response.defer.assert_awaited_once_with()
+            self.assertIn(
+                "Appended folder containing 2 local media files to the end of VLC's playlist",
+                interaction.edit_original_response.await_args.kwargs["content"],
+            )
 
     async def test_playback_end_does_not_close_vlc_process(self) -> None:
         class RunningProcess:
@@ -926,11 +1057,15 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
                 {"state": "paused"},
                 {"state": "playing"},
                 {"state": "stopped"},
+                {"state": "playing"},
+                {"state": "stopped"},
             ],
         ) as request:
             session.pause()
             session.resume()
             session.stop()
+            session.advance()
+            session.clear_playlist()
 
         self.assertEqual(
             request.call_args_list,
@@ -938,9 +1073,140 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
                 call({"command": "pl_forcepause"}),
                 call({"command": "pl_forceresume"}),
                 call({"command": "pl_stop"}),
+                call({"command": "pl_next"}),
+                call({"command": "pl_empty"}),
             ],
         )
         self.assertIsNone(session.process.poll())
+
+    def test_local_files_append_to_existing_vlc_playlist_without_clearing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "media"
+            root.mkdir()
+            first = root / "01.mkv"
+            second = root / "02.mp4"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            session = discord_bot.VLCSession("vlc.exe")
+
+            with (
+                patch.object(discord_bot, "MEDIA_DIR", root),
+                patch.object(session, "ensure_started"),
+                patch.object(
+                    session,
+                    "playlist",
+                    return_value=[
+                        discord_bot.VLCPlaylistItem("7", "Active", 300, True)
+                    ],
+                ),
+                patch.object(session, "status", return_value={"state": "playing"}),
+                patch.object(session, "_request", return_value={}) as request,
+            ):
+                existing, started = session.enqueue_local_inputs([first, second])
+
+        self.assertEqual(existing, 1)
+        self.assertFalse(started)
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call({"command": "in_enqueue", "input": str(first)}),
+                call({"command": "in_enqueue", "input": str(second)}),
+            ],
+        )
+        self.assertNotIn(call({"command": "pl_empty"}), request.call_args_list)
+
+    def test_vlc_request_percent_encodes_local_path_spaces(self) -> None:
+        session = discord_bot.VLCSession("vlc.exe")
+        local_path = r"C:\media\Show + Extras\Episode 01.mkv"
+
+        with patch.object(
+            discord_bot,
+            "urlopen",
+            return_value=io.BytesIO(b"{}"),
+        ) as open_url:
+            session._request({"command": "in_enqueue", "input": local_path})
+
+        request = open_url.call_args.args[0]
+        self.assertIn("Show%20%2B%20Extras", request.full_url)
+        self.assertIn("Episode%2001.mkv", request.full_url)
+        self.assertNotIn("Show+%2B+Extras", request.full_url)
+
+    def test_local_files_explicitly_start_vlc_when_playlist_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "media"
+            root.mkdir()
+            first = root / "01.mkv"
+            second = root / "02.mp4"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            session = discord_bot.VLCSession("vlc.exe")
+
+            with (
+                patch.object(discord_bot, "MEDIA_DIR", root),
+                patch.object(session, "ensure_started"),
+                patch.object(
+                    session,
+                    "playlist",
+                    side_effect=[
+                        [],
+                        [
+                            discord_bot.VLCPlaylistItem(
+                                "8", "First", 300, False
+                            ),
+                            discord_bot.VLCPlaylistItem(
+                                "9", "Second", 300, False
+                            ),
+                        ],
+                    ],
+                ),
+                patch.object(session, "status", return_value={"state": "stopped"}),
+                patch.object(session, "_request", return_value={}) as request,
+            ):
+                existing, started = session.enqueue_local_inputs([first, second])
+
+        self.assertEqual(existing, 0)
+        self.assertTrue(started)
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call({"command": "in_enqueue", "input": str(first)}),
+                call({"command": "in_enqueue", "input": str(second)}),
+                call({"command": "pl_play", "id": "8"}),
+            ],
+        )
+
+    def test_local_file_starts_when_existing_vlc_playlist_is_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "media"
+            root.mkdir()
+            local_file = root / "episode.mkv"
+            local_file.write_bytes(b"episode")
+            old_item = discord_bot.VLCPlaylistItem("4", "Old", 300, True)
+            new_item = discord_bot.VLCPlaylistItem("5", "Episode", 300, False)
+            session = discord_bot.VLCSession("vlc.exe")
+
+            with (
+                patch.object(discord_bot, "MEDIA_DIR", root),
+                patch.object(session, "ensure_started"),
+                patch.object(
+                    session,
+                    "playlist",
+                    side_effect=[[old_item], [old_item, new_item]],
+                ),
+                patch.object(session, "status", return_value={"state": "stopped"}),
+                patch.object(session, "_request", return_value={}) as request,
+            ):
+                existing, started = session.enqueue_local_inputs([local_file])
+
+        self.assertEqual(existing, 1)
+        self.assertTrue(started)
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call({"command": "in_enqueue", "input": str(local_file)}),
+                call({"command": "pl_play", "id": "5"}),
+            ],
+        )
 
     def test_vlc_seek_uses_absolute_seconds_without_closing_player(self) -> None:
         class RunningProcess:
@@ -1017,6 +1283,30 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
             request.call_args_list,
             [call(), call({"command": "seek", "val": "0S"})],
         )
+
+    async def test_pause_and_resume_control_local_or_manual_vlc_media(self) -> None:
+        state = discord_bot.GuildState(guild_id=123)
+        state.vlc = MagicMock()
+        state.vlc.is_running.return_value = True
+        discord_bot.GUILD_STATE[123] = state
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        pause_context = FakeContext()
+        resume_context = FakeContext()
+
+        try:
+            pause = bot.get_command("pause")
+            resume = bot.get_command("resume")
+            self.assertIsNotNone(pause)
+            self.assertIsNotNone(resume)
+            await pause.callback(pause_context)  # type: ignore[arg-type, union-attr]
+            await resume.callback(resume_context)  # type: ignore[arg-type, union-attr]
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        state.vlc.pause.assert_called_once_with()
+        state.vlc.resume.assert_called_once_with()
+        self.assertEqual(pause_context.replies[-1], "Playback paused.")
+        self.assertEqual(resume_context.replies[-1], "Playback resumed.")
 
     async def test_seek_command_moves_current_playback(self) -> None:
         state = discord_bot.GuildState(guild_id=123)
@@ -1136,6 +1426,48 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state.cancel_current)
         self.assertIn("VLC remains open", context.replies[-1])
         self.assertIn("Removed from the queue", pending_message.edits[-1]["content"])
+
+    async def test_clear_removes_vlc_playlist_and_all_bot_requests(self) -> None:
+        state = discord_bot.GuildState(guild_id=123)
+        current_message = FakeMessage()
+        pending_message = FakeMessage()
+        state.current = discord_bot.MediaRequest(
+            url="https://example.com/current",
+            requester=FakeRequester(),  # type: ignore[arg-type]
+            status_message=current_message,  # type: ignore[arg-type]
+        )
+        await state.queue.put(
+            discord_bot.MediaRequest(
+                url="https://example.com/pending",
+                requester=FakeRequester(),  # type: ignore[arg-type]
+                status_message=pending_message,  # type: ignore[arg-type]
+            )
+        )
+        state.vlc = MagicMock()
+        state.vlc.is_running.return_value = True
+        state.vlc.playlist.return_value = [
+            discord_bot.VLCPlaylistItem("7", "Current", 300, True),
+            discord_bot.VLCPlaylistItem("8", "Manual item", 90, False),
+        ]
+        discord_bot.GUILD_STATE[123] = state
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        context = FakeContext()
+
+        try:
+            command = bot.get_command("clear")
+            self.assertIsNotNone(command)
+            await command.callback(context)  # type: ignore[arg-type, union-attr]
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        state.vlc.clear_playlist.assert_called_once_with()
+        self.assertEqual(state.queue.qsize(), 0)
+        self.assertTrue(state.cancel_current)
+        self.assertEqual(state.completion_note, "Playlist cleared by requester")
+        self.assertIn("Removed from the queue", pending_message.edits[-1]["content"])
+        self.assertIn("removed 2 VLC items", context.replies[-1])
+        self.assertIn("cleared 2 bot requests", context.replies[-1])
+        self.assertIn("VLC remains open", context.replies[-1])
 
     async def test_skip_during_resolution_never_opens_the_media(self) -> None:
         resolution_started = asyncio.Event()

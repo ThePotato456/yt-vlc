@@ -137,11 +137,13 @@ Playback commands:
 | Command | Behavior |
 |---|---|
 | `!play <URL>`, `!p <URL>` | Add a media URL to the lazy queue |
+| `!local`, `!localqueue`, `!media` | Interactively browse and queue files beneath `./media/` |
 | `!pause` | Pause the current item |
 | `!resume` | Resume the paused item |
-| `!skip`, `!s` | Stop the current item and advance to the next request |
+| `!skip`, `!s` | Advance to the next VLC playlist item or queued request |
 | `!seek <[+/-]seconds\|[+/-]MM:SS\|[+/-]HH:MM:SS>` | Seek absolutely, or move relative to the current time with `+`/`-` |
 | `!stop` | Stop playback and clear pending requests without closing VLC |
+| `!clear`, `!clearplaylist` | Remove VLC playlist items and all bot requests without closing VLC |
 | `!queue`, `!q` | Show bot requests plus VLC's live playlist and active item |
 
 Seek positions may be written as raw seconds (`!seek 90`), minutes and seconds
@@ -158,7 +160,31 @@ Files or network media added manually through VLC therefore appear even when
 they did not originate from `!play`, and VLC's actual active item is marked
 **Now playing**. Local folder paths and raw signed stream URLs are not exposed
 in Discord. `!seek` also operates on VLC's actual active item, so manually
-added files do not need a corresponding bot request.
+added files do not need a corresponding bot request. `!pause` and `!resume`
+likewise control VLC directly and work for `!local` files and manually added
+playlist items.
+
+`!clear` empties both sides shown by `!queue`: VLC's native playlist (including
+manually added files) and the bot's current and pending requests. The VLC window
+stays open so an active Discord screen share remains attached.
+
+### Local media browser
+
+Run `!local` to open a requester-scoped Discord menu rooted at `./media/`. The
+menu supports folder navigation, pagination, queueing one selected file, and
+recursively queueing every supported file in the current folder. Folder queues
+preserve alphabetical path order and append directly to the end of VLC's native
+playlist without interrupting or removing its active item. If VLC's playlist is
+empty, the bot explicitly starts playback after queueing. Recursive folder
+selections are sent to VLC as one folder input with recursive expansion enabled,
+rather than issuing a separate VLC request for every discovered file.
+
+The bot creates `./media/` when the command is first used. It recognizes common
+video and audio types including MP4, MKV, WebM, MOV, AVI, MP3, M4A, FLAC, WAV,
+OGG, and Opus. Paths are resolved and checked before browsing and again before
+playback; symlinks or selections that escape `./media/` are rejected. Discord
+messages show only `media/...` relative names, never absolute local paths. The
+folder is excluded from Git so local media cannot be committed accidentally.
 
 The commands work in the configured server and in direct messages from the
 Discord application owner. DM commands from every other account are rejected.

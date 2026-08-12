@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, Sequence
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import discord
@@ -32,6 +32,7 @@ import yt_vlc
 
 APP_DIR = Path(__file__).resolve().parent
 ENV_FILE = APP_DIR / ".env"
+MEDIA_DIR = APP_DIR / "media"
 DEFAULT_LOG_FILE = APP_DIR / "logs" / "discord_bot.log"
 COMMAND_PREFIX = "!"
 MAX_DISCORD_TEXT = 1_000
@@ -45,9 +46,36 @@ VLC_SHUTDOWN_TIMEOUT = 5.0
 VLC_PLAYBACK_TIMEOUT = 30.0
 VLC_POLL_INTERVAL = 0.5
 VLC_STALL_TIMEOUT = 12.0
+VLC_PLAYLIST_UPDATE_TIMEOUT = 5.0
+VLC_PLAYLIST_UPDATE_POLL_INTERVAL = 0.1
 DEFAULT_VLC_AUDIO_OUTPUT = "directsound"
 VLC_AUDIO_OUTPUTS = {"automatic", "directsound", "mmdevice", "waveout"}
 QUEUE_PREFETCH_SECONDS = 8.0
+LOCAL_BROWSER_PAGE_SIZE = 20
+LOCAL_MEDIA_EXTENSIONS = {
+    ".3gp",
+    ".aac",
+    ".avi",
+    ".flac",
+    ".m4a",
+    ".m4v",
+    ".mka",
+    ".mkv",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".oga",
+    ".ogg",
+    ".ogv",
+    ".opus",
+    ".ts",
+    ".wav",
+    ".webm",
+    ".wma",
+    ".wmv",
+}
 STABILITY_FALLBACK_FORMAT = (
     "b[height>=720][height<=720]/"
     "bv*[height<=720]+ba/b[height<=720]/b"
@@ -126,6 +154,7 @@ class MediaRequest:
     status_message: discord.Message
     bot: commands.Bot | None = field(default=None, repr=False)
     cookie_data: bytes | None = field(default=None, repr=False)
+    local_path: Path | None = field(default=None, repr=False)
 
 
 @dataclass(slots=True)
@@ -225,6 +254,66 @@ def vlc_playlist_title(name: object, uri: object) -> str:
     return f"{candidate[:157]}..." if len(candidate) > 160 else candidate
 
 
+def resolve_local_media_path(path: Path, *, directory: bool | None = None) -> Path:
+    """Resolve a path and prove it remains inside ./media."""
+    root = MEDIA_DIR.resolve()
+    resolved = path.resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError("local media path escapes the ./media directory") from error
+    if directory is True and not resolved.is_dir():
+        raise ValueError("local media folder no longer exists")
+    if directory is False and not resolved.is_file():
+        raise ValueError("local media file no longer exists")
+    return resolved
+
+
+def local_media_label(path: Path) -> str:
+    """Return a safe project-relative label without exposing an absolute path."""
+    resolved = resolve_local_media_path(path)
+    relative = resolved.relative_to(MEDIA_DIR.resolve())
+    return "media" if not relative.parts else f"media/{relative.as_posix()}"
+
+
+def is_supported_local_media(path: Path) -> bool:
+    return path.suffix.lower() in LOCAL_MEDIA_EXTENSIONS
+
+
+def local_directory_entries(directory: Path) -> list[Path]:
+    """List safe child folders and supported files for the interactive browser."""
+    current = resolve_local_media_path(directory, directory=True)
+    folders: list[Path] = []
+    files: list[Path] = []
+    for candidate in current.iterdir():
+        try:
+            resolved = resolve_local_media_path(candidate)
+        except (OSError, ValueError):
+            continue
+        if resolved.is_dir():
+            folders.append(resolved)
+        elif resolved.is_file() and is_supported_local_media(resolved):
+            files.append(resolved)
+    return sorted(folders, key=lambda item: item.name.casefold()) + sorted(
+        files,
+        key=lambda item: item.name.casefold(),
+    )
+
+
+def local_folder_media(directory: Path) -> list[Path]:
+    """Return every supported file recursively, excluding links outside ./media."""
+    current = resolve_local_media_path(directory, directory=True)
+    found: dict[Path, None] = {}
+    for candidate in current.rglob("*"):
+        try:
+            resolved = resolve_local_media_path(candidate, directory=False)
+        except (OSError, ValueError):
+            continue
+        if is_supported_local_media(resolved):
+            found[resolved] = None
+    return sorted(found, key=lambda item: local_media_label(item).casefold())
+
+
 def configured_vlc_audio_output() -> str | None:
     """Return the validated Windows audio module used for Discord capture."""
     value = os.environ.get(
@@ -262,7 +351,9 @@ class VLCSession:
         endpoint: str,
         params: dict[str, str] | None = None,
     ) -> dict[str, object]:
-        query = f"?{urlencode(params)}" if params else ""
+        # VLC's HTTP interface does not treat '+' as a space in input paths.
+        # Percent-encode spaces so Windows paths arrive unchanged.
+        query = f"?{urlencode(params, quote_via=quote)}" if params else ""
         request = Request(
             f"http://127.0.0.1:{self.port}/requests/{endpoint}{query}",
             headers={"Authorization": self._authorization()},
@@ -374,6 +465,7 @@ class VLCSession:
             "--http-host=127.0.0.1",
             f"--http-port={self.port}",
             f"--http-password={self.password}",
+            "--recursive=expand",
             "--no-qt-privacy-ask",
             "--no-video-title-show",
         ]
@@ -447,6 +539,54 @@ class VLCSession:
             command["option"] = f"input-slave={media.streams[1]}"
         return self._request(command)
 
+    def enqueue_local_inputs(self, paths: Sequence[Path]) -> tuple[int, bool]:
+        """Append local inputs and start the first new item when VLC is idle."""
+        self.ensure_started()
+        resolved = [resolve_local_media_path(path) for path in paths]
+        for path in resolved:
+            if path.is_file() and not is_supported_local_media(path):
+                raise ValueError(f"unsupported local media type: {path.suffix or 'none'}")
+        existing_items = self.playlist()
+        existing_count = len(existing_items)
+        existing_ids = {item.item_id for item in existing_items}
+        state_name = str(self.status().get("state", "")).lower()
+        should_start = bool(resolved) and state_name not in ACTIVE_VLC_STATES
+        for path in resolved:
+            self._request({"command": "in_enqueue", "input": str(path)})
+        started = False
+        if should_start:
+            deadline = time.monotonic() + VLC_PLAYLIST_UPDATE_TIMEOUT
+            while time.monotonic() < deadline:
+                new_item = next(
+                    (
+                        item
+                        for item in self.playlist()
+                        if item.item_id and item.item_id not in existing_ids
+                    ),
+                    None,
+                )
+                if new_item is not None:
+                    self._request(
+                        {"command": "pl_play", "id": new_item.item_id}
+                    )
+                    started = True
+                    break
+                time.sleep(VLC_PLAYLIST_UPDATE_POLL_INTERVAL)
+            if not started:
+                raise RuntimeError(
+                    "VLC queued the local media but did not expose a playable "
+                    "playlist item in time"
+                )
+        LOGGER.info(
+            "Appended local inputs to VLC count=%s existing=%s state=%s "
+            "started_first=%s",
+            len(resolved),
+            existing_count,
+            state_name or "unknown",
+            started,
+        )
+        return existing_count, started
+
     def pause(self) -> dict[str, object]:
         if not self.is_running():
             raise RuntimeError("VLC is not running")
@@ -464,6 +604,18 @@ class VLCSession:
             raise RuntimeError("VLC is not running")
         LOGGER.info("Stopping current VLC item; player process remains open")
         return self._request({"command": "pl_stop"})
+
+    def advance(self) -> dict[str, object]:
+        if not self.is_running():
+            raise RuntimeError("VLC is not running")
+        LOGGER.info("Advancing to the next VLC playlist item")
+        return self._request({"command": "pl_next"})
+
+    def clear_playlist(self) -> dict[str, object]:
+        if not self.is_running():
+            raise RuntimeError("VLC is not running")
+        LOGGER.info("Clearing VLC playlist; player process remains open")
+        return self._request({"command": "pl_empty"})
 
     def _seek_when_ready(
         self,
@@ -519,6 +671,7 @@ class VLCSession:
         self,
         initial_status: dict[str, object],
         on_near_end: Callable[[], bool] | None = None,
+        should_stop_waiting: Callable[[], bool] | None = None,
     ) -> None:
         """Wait for the current item to stop without waiting for VLC to exit."""
         state_name = str(initial_status.get("state", "")).lower()
@@ -534,6 +687,8 @@ class VLCSession:
             if self.process is None or self.process.poll() is not None:
                 exit_code = None if self.process is None else self.process.returncode
                 raise RuntimeError(f"VLC closed during playback (code {exit_code})")
+            if should_stop_waiting is not None and should_stop_waiting():
+                return
 
             status = await asyncio.to_thread(self.status)
             state_name = str(status.get("state", "")).lower()
@@ -1052,6 +1207,25 @@ def resolve_media(
     return PreparedMedia(vlc=vlc, streams=streams, info=media_info)
 
 
+def resolve_local_media(path: Path) -> PreparedMedia:
+    """Prepare a trusted file beneath ./media without sending it through yt-dlp."""
+    resolved = resolve_local_media_path(path, directory=False)
+    if not is_supported_local_media(resolved):
+        raise RuntimeError(f"Unsupported local media type: {resolved.suffix or 'none'}")
+    _, vlc, _ = runtime_programs()
+    return PreparedMedia(
+        vlc=vlc,
+        streams=[str(resolved)],
+        info={
+            "title": resolved.name,
+            "uploader": "Local media",
+            "resolution": f"Local {resolved.suffix.lstrip('.').upper()} file",
+            "filesize_approx": resolved.stat().st_size,
+            "_local_media": True,
+        },
+    )
+
+
 def now_playing_embed(
     info: dict[str, object],
     requester: discord.abc.User,
@@ -1080,7 +1254,11 @@ def now_playing_embed(
         embed.add_field(name="Creator", value=str(creator)[:256], inline=True)
     embed.add_field(
         name="Streams",
-        value="Video + audio" if stream_count == 2 else "Combined",
+        value=(
+            "Local file"
+            if info.get("_local_media") is True
+            else "Video + audio" if stream_count == 2 else "Combined"
+        ),
         inline=True,
     )
     return embed
@@ -1104,6 +1282,8 @@ def resolve_request_media(
     format_selector: str = yt_vlc.DEFAULT_FORMAT,
 ) -> PreparedMedia:
     """Resolve a queued request, adding temporary cookies only when supplied."""
+    if request.local_path is not None:
+        return resolve_local_media(request.local_path)
     if request.cookie_data is not None:
         return resolve_media(request.url, format_selector, request.cookie_data)
     if format_selector != yt_vlc.DEFAULT_FORMAT:
@@ -1189,7 +1369,13 @@ async def mark_requests_removed(
 
 
 def queue_line(request: MediaRequest, label: str) -> str:
-    if is_sensitive_link(request.url):
+    if request.local_path is not None:
+        try:
+            local_label = local_media_label(request.local_path)
+        except (OSError, ValueError):
+            local_label = request.url.removeprefix("local:")
+        rendered_url = f"`{discord.utils.escape_markdown(local_label)}`"
+    elif is_sensitive_link(request.url):
         rendered_url = f"`{REDACTED_LINK}`"
     else:
         url = request.url
@@ -1344,6 +1530,7 @@ async def run_guild_queue(state: GuildState) -> None:
                 await state.vlc.wait_until_finished(
                     initial_status,
                     on_near_end=lambda: start_next_prefetch(state),
+                    should_stop_waiting=lambda: state.cancel_current,
                 )
             except PlaybackStalled as stalled:
                 LOGGER.warning(
@@ -1404,6 +1591,7 @@ async def run_guild_queue(state: GuildState) -> None:
                 await state.vlc.wait_until_finished(
                     initial_status,
                     on_near_end=lambda: start_next_prefetch(state),
+                    should_stop_waiting=lambda: state.cancel_current,
                 )
 
             completion = state.completion_note or "Playback finished"
@@ -1456,6 +1644,263 @@ def ensure_guild_worker(state: GuildState) -> None:
             run_guild_queue(state),
             name=f"yt-vlc-guild-{state.guild_id}",
         )
+
+
+class LocalMediaSelect(discord.ui.Select):
+    def __init__(self, browser: LocalMediaBrowserView) -> None:
+        self.browser = browser
+        super().__init__(placeholder="Choose a file, folder, or action", options=[])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.browser.handle_selection(interaction, self.values[0])
+
+
+class LocalMediaBrowserView(discord.ui.View):
+    """Requester-scoped Discord browser rooted at the project's ./media folder."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        state: GuildState,
+        requester: discord.User | discord.Member,
+    ) -> None:
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.state = state
+        self.requester = requester
+        self.current = MEDIA_DIR.resolve()
+        self.page = 0
+        self.page_entries: list[Path] = []
+        self.message: discord.Message | None = None
+        self.selector = LocalMediaSelect(self)
+        self.add_item(self.selector)
+        self.refresh()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user is not None and interaction.user.id == self.requester.id:
+            return True
+        await interaction.response.send_message(
+            "Only the user who opened this local-media browser can use it.",
+            ephemeral=True,
+        )
+        return False
+
+    def refresh(self) -> None:
+        entries = local_directory_entries(self.current)
+        page_count = max(1, math.ceil(len(entries) / LOCAL_BROWSER_PAGE_SIZE))
+        self.page = min(max(0, self.page), page_count - 1)
+        start = self.page * LOCAL_BROWSER_PAGE_SIZE
+        self.page_entries = entries[start : start + LOCAL_BROWSER_PAGE_SIZE]
+
+        options: list[discord.SelectOption] = [
+            discord.SelectOption(
+                label="Queue this folder recursively",
+                value="queue-folder",
+                emoji="➕",
+            )
+        ]
+        if self.current != MEDIA_DIR.resolve():
+            options.append(discord.SelectOption(label="Go up", value="up", emoji="⬆️"))
+        if self.page > 0:
+            options.append(
+                discord.SelectOption(label="Previous page", value="previous", emoji="◀️")
+            )
+        if self.page + 1 < page_count:
+            options.append(discord.SelectOption(label="Next page", value="next", emoji="▶️"))
+        options.extend(
+            discord.SelectOption(
+                label=entry.name[:100],
+                value=f"entry:{index}",
+                emoji="📁" if entry.is_dir() else "🎬",
+                description=(
+                    "Open folder"
+                    if entry.is_dir()
+                    else f"Queue {entry.suffix.lstrip('.').upper()} file"
+                ),
+            )
+            for index, entry in enumerate(self.page_entries)
+        )
+        self.selector.options = options[:25]
+
+    def embed(self) -> discord.Embed:
+        relative = self.current.relative_to(MEDIA_DIR.resolve())
+        location = "media/" if not relative.parts else f"media/{relative.as_posix()}/"
+        entries = local_directory_entries(self.current)
+        page_count = max(1, math.ceil(len(entries) / LOCAL_BROWSER_PAGE_SIZE))
+        lines = [
+            f"`{'📁' if entry.is_dir() else '🎬'} {discord.utils.escape_markdown(entry.name)}`"
+            for entry in self.page_entries
+        ]
+        description = "\n".join(lines) if lines else "*No supported media in this folder.*"
+        embed = discord.Embed(
+            title="Local media queue",
+            description=description[:MAX_QUEUE_EMBED_DESCRIPTION],
+            color=0xF26B38,
+        )
+        embed.add_field(name="Folder", value=f"`{location}`", inline=False)
+        embed.set_footer(
+            text=(
+                f"Page {self.page + 1}/{page_count} • select a file, browse a folder, "
+                "or queue this folder recursively"
+            )
+        )
+        return embed
+
+    async def enqueue(
+        self,
+        interaction: discord.Interaction,
+        paths: list[Path],
+        *,
+        media_count: int | None = None,
+    ) -> None:
+        if not paths:
+            await interaction.response.send_message(
+                "That folder contains no supported media files.",
+                ephemeral=True,
+            )
+            return
+        try:
+            resolved_paths = [resolve_local_media_path(path) for path in paths]
+        except (OSError, ValueError) as error:
+            await interaction.response.send_message(
+                f"A selected local file is no longer available: {error}",
+                ephemeral=True,
+            )
+            return
+        message = interaction.message
+        if message is None:
+            await interaction.response.send_message(
+                "The local-media browser message is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        try:
+            if self.state.vlc is None:
+                _, executable, _ = await asyncio.to_thread(runtime_programs)
+                self.state.vlc = VLCSession(executable)
+            existing_count, started = await asyncio.to_thread(
+                self.state.vlc.enqueue_local_inputs,
+                resolved_paths,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            LOGGER.exception(
+                "Could not append local media guild=%s requester=%s",
+                self.state.guild_id,
+                self.requester.id,
+            )
+            await interaction.edit_original_response(
+                content=f"Could not queue local media in VLC: {error}",
+                embed=None,
+                view=None,
+            )
+            self.stop()
+            return
+        LOGGER.info(
+            "Queued local media in VLC guild=%s requester=%s count=%s "
+            "existing=%s started_first=%s",
+            self.state.guild_id,
+            self.requester.id,
+            media_count if media_count is not None else len(resolved_paths),
+            existing_count,
+            started,
+        )
+        queued_count = media_count if media_count is not None else len(resolved_paths)
+        subject = (
+            f"folder containing {queued_count} local media file"
+            f"{'s' if queued_count != 1 else ''}"
+            if media_count is not None
+            else f"{queued_count} local media file"
+            f"{'s' if queued_count != 1 else ''}"
+        )
+        result_text = (
+            f"Started {subject} in an empty VLC playlist."
+            if started
+            else f"Appended {subject} to the end of VLC's playlist."
+        )
+        await interaction.edit_original_response(
+            content=result_text,
+            embed=None,
+            view=None,
+        )
+        self.stop()
+
+    async def handle_selection(
+        self,
+        interaction: discord.Interaction,
+        selection: str,
+    ) -> None:
+        if selection == "queue-folder":
+            try:
+                media = await asyncio.to_thread(local_folder_media, self.current)
+            except (OSError, ValueError) as error:
+                await interaction.response.send_message(
+                    f"That local folder is no longer available: {error}",
+                    ephemeral=True,
+                )
+                return
+            if not media:
+                await interaction.response.send_message(
+                    "That folder contains no supported media files.",
+                    ephemeral=True,
+                )
+                return
+            await self.enqueue(
+                interaction,
+                [self.current],
+                media_count=len(media),
+            )
+            return
+        if selection == "up":
+            self.current = resolve_local_media_path(
+                self.current.parent,
+                directory=True,
+            )
+            self.page = 0
+        elif selection == "previous":
+            self.page -= 1
+        elif selection == "next":
+            self.page += 1
+        elif selection.startswith("entry:"):
+            try:
+                entry = self.page_entries[int(selection.partition(":")[2])]
+            except (IndexError, ValueError):
+                await interaction.response.send_message(
+                    "That browser selection is no longer valid.",
+                    ephemeral=True,
+                )
+                return
+            if entry.is_dir():
+                self.current = resolve_local_media_path(entry, directory=True)
+                self.page = 0
+            else:
+                await self.enqueue(interaction, [entry])
+                return
+        self.refresh()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Local media browser closed.",
+            embed=None,
+            view=None,
+        )
+        self.stop()
 
 
 async def warm_up_vlc(state: GuildState) -> None:
@@ -1632,6 +2077,29 @@ def build_bot(
             return
         raise error
 
+    @bot.command(name="local", aliases=["localqueue", "media"])
+    async def local_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Browse and queue files located beneath the project's ./media folder."""
+        if not await allowed_context(ctx):
+            return
+        try:
+            MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            state = get_guild_state(target_guild_id(ctx))
+            view = LocalMediaBrowserView(bot, state, ctx.author)
+        except OSError as error:
+            LOGGER.exception("Could not open local media browser")
+            await ctx.reply(
+                f"Could not open `./media/`: {str(error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+            return
+        message = await ctx.reply(
+            embed=view.embed(),
+            view=view,
+            mention_author=False,
+        )
+        view.message = message
+
     @bot.command(name="pause")
     async def pause_command(ctx: commands.Context[commands.Bot]) -> None:
         """Pause the current VLC item."""
@@ -1640,7 +2108,6 @@ def build_bot(
         state = GUILD_STATE.get(target_guild_id(ctx))
         if (
             state is None
-            or state.current is None
             or state.vlc is None
             or not state.vlc.is_running()
         ):
@@ -1664,7 +2131,6 @@ def build_bot(
         state = GUILD_STATE.get(target_guild_id(ctx))
         if (
             state is None
-            or state.current is None
             or state.vlc is None
             or not state.vlc.is_running()
         ):
@@ -1682,24 +2148,43 @@ def build_bot(
 
     @bot.command(name="skip", aliases=["next", "s"])
     async def skip_command(ctx: commands.Context[commands.Bot]) -> None:
-        """Stop the current item and advance the lazy queue."""
+        """Advance VLC and release the current lazy-queue request."""
         if not await allowed_context(ctx):
             return
         state = GUILD_STATE.get(target_guild_id(ctx))
-        if state is None or state.current is None:
+        if state is None:
             await ctx.reply("Nothing is currently playing.", mention_author=False)
             return
         try:
-            state.completion_note = f"Skipped by {ctx.author.display_name}"
-            state.cancel_current = True
-            if state.vlc is not None and state.vlc.is_running():
-                await asyncio.to_thread(state.vlc.stop)
+            has_bot_request = state.current is not None
+            if has_bot_request:
+                state.completion_note = f"Skipped by {ctx.author.display_name}"
+            has_running_vlc = state.vlc is not None and state.vlc.is_running()
+            if not has_bot_request and not has_running_vlc:
+                await ctx.reply(
+                    "Nothing is currently playing.",
+                    mention_author=False,
+                )
+                return
+            if has_running_vlc:
+                assert state.vlc is not None
+                await asyncio.to_thread(state.vlc.advance)
+            if has_bot_request:
+                state.cancel_current = True
             LOGGER.info(
-                "Skip requested guild=%s requester=%s",
+                "Skip requested guild=%s requester=%s bot_request=%s",
                 state.guild_id,
                 getattr(ctx.author, "id", "unknown"),
+                has_bot_request,
             )
-            await ctx.reply("Skipped the current request.", mention_author=False)
+            await ctx.reply(
+                (
+                    "Skipped the current request."
+                    if has_bot_request
+                    else "Advanced the VLC playlist."
+                ),
+                mention_author=False,
+            )
         except Exception as error:
             LOGGER.exception("Skip command failed guild=%s", state.guild_id)
             state.completion_note = None
@@ -1838,6 +2323,81 @@ def build_bot(
         )
         await ctx.reply(
             f"Playback stopped; VLC remains open.{queue_note}",
+            mention_author=False,
+        )
+
+    @bot.command(name="clear", aliases=["clearplaylist"])
+    async def clear_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Clear bot requests and VLC's native playlist without closing VLC."""
+        if not await allowed_context(ctx):
+            return
+        state = GUILD_STATE.get(target_guild_id(ctx))
+        if state is None:
+            await ctx.reply("The playlist is already empty.", mention_author=False)
+            return
+
+        vlc_running = state.vlc is not None and state.vlc.is_running()
+        vlc_count = 0
+        if vlc_running and state.vlc is not None:
+            try:
+                vlc_count = len(await asyncio.to_thread(state.vlc.playlist))
+            except (OSError, RuntimeError, ValueError):
+                LOGGER.exception(
+                    "Could not count VLC playlist before clearing guild=%s",
+                    state.guild_id,
+                )
+
+        removed = drain_pending_requests(state)
+        cancelled_current = state.current is not None
+        if cancelled_current:
+            state.completion_note = f"Playlist cleared by {ctx.author.display_name}"
+            state.cancel_current = True
+
+        clear_error: Exception | None = None
+        try:
+            if vlc_running and state.vlc is not None:
+                await asyncio.to_thread(state.vlc.clear_playlist)
+        except Exception as error:
+            clear_error = error
+            LOGGER.exception("Clear playlist command failed guild=%s", state.guild_id)
+        finally:
+            await mark_requests_removed(
+                removed,
+                f"Removed from the queue by {ctx.author.display_name}.",
+            )
+
+        if clear_error is not None:
+            await ctx.reply(
+                f"Bot requests were cleared, but VLC's playlist could not be "
+                f"cleared: {str(clear_error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+            return
+
+        bot_count = len(removed) + (1 if cancelled_current else 0)
+        if not vlc_running and bot_count == 0:
+            await ctx.reply("The playlist is already empty.", mention_author=False)
+            return
+
+        LOGGER.info(
+            "Playlist cleared guild=%s requester=%s vlc_items=%s bot_requests=%s",
+            state.guild_id,
+            getattr(ctx.author, "id", "unknown"),
+            vlc_count,
+            bot_count,
+        )
+        details = []
+        if vlc_count:
+            details.append(
+                f"removed {vlc_count} VLC item{'s' if vlc_count != 1 else ''}"
+            )
+        if bot_count:
+            details.append(
+                f"cleared {bot_count} bot request{'s' if bot_count != 1 else ''}"
+            )
+        detail_note = f" ({'; '.join(details)})" if details else ""
+        await ctx.reply(
+            f"Playlist cleared{detail_note}; VLC remains open.",
             mention_author=False,
         )
 
