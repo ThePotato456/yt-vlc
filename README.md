@@ -6,12 +6,12 @@
 ![Deno 2.8.1](https://img.shields.io/badge/Deno-2.8.1-000000?logo=deno&logoColor=white)
 ![VLC 3.0.23](https://img.shields.io/badge/VLC-3.0.23-FF8800?logo=vlcmediaplayer&logoColor=white)
 
-Stream online media in VLC without downloading the video first. `yt-vlc`
-resolves a media page through `yt-dlp -g`, then sends the resulting network
-stream URLs directly to VLC.
+Stream online media directly in VLC with a polished Windows CLI and an optional
+Discord request bot.
 
-When a site provides separate video and audio streams, the script opens the
-video as VLC's primary input and attaches the audio with `--input-slave`.
+`yt-vlc` uses `yt-dlp -g` to resolve a media page, then hands the resulting
+network stream URLs to VLC. Separate video and audio streams are supported
+without downloading the complete media file first.
 
 ## Screenshots
 
@@ -23,275 +23,78 @@ video as VLC's primary input and attaches the audio with `--input-slave`.
 
 ![yt-vlc prerequisite download progress](docs/screenshots/first-run-setup.png)
 
-## Features
+## Highlights
 
-- Plays supported media pages directly in VLC
-- Handles combined streams and separate video/audio streams
-- Uses combined streams only at 720p or better, otherwise preferring up to 1080p
-- Replaces the currently playing VLC item when the script is run again
-- Provides a colorized, in-place status line that keeps terminal output compact
-- Displays live progress bars while downloading prerequisites
-- Animates media resolution with a Braille spinner
-- Shows title, creator, duration, quality, codecs, and estimated media size
-- Supports the full yt-dlp format-selector syntax
-- Downloads pinned Windows builds of yt-dlp, Deno, and portable VLC automatically
-- Enables yt-dlp's JavaScript challenge solver for reliable YouTube extraction
-- Reuses local tools after the first run
-- Accepts custom yt-dlp, Deno, and VLC executable paths
-- Can print resolved stream URLs without opening VLC
-- Prevents accidental playlist expansion
+- Resolves media supported by yt-dlp and opens it directly in VLC
+- Supports combined streams and separate video/audio streams
+- Prefers combined video at 720p or better, then separate streams up to 1080p
+- Replaces the current VLC item when the CLI is run again
+- Displays a compact status interface, download progress, and media metadata
+- Downloads pinned portable builds of yt-dlp, Deno, and VLC on first use
+- Uses Deno for yt-dlp's YouTube JavaScript challenge handling
+- Provides an optional Discord bot with a lazy request queue
+- Controls VLC playback, seeking, local files, and the native VLC playlist
+- Keeps one VLC window open so a Discord application share remains attached
+- Redacts sensitive debrid URLs from Discord output and logs
 
 ## Requirements
 
 - Windows 10 or later
 - Python 3.10 or later
-- Internet access during initial setup and stream resolution
+- Internet access for initial setup and network playback
 
-No manual yt-dlp, JavaScript runtime, or VLC installation is required. On first use, the script
-creates the following local structure:
+The CLI uses only the Python standard library. The Discord bot additionally
+requires the package listed in `requirements.txt`.
+
+## Installation
+
+Clone the repository and enter the project directory:
+
+```powershell
+git clone https://github.com/ThePotato456/yt-vlc.git
+Set-Location .\yt-vlc
+```
+
+Creating a virtual environment is recommended:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r .\requirements.txt
+```
+
+On first launch, the program downloads its pinned Windows dependencies into
+`./bin`:
 
 ```text
 bin/
-├── deno.exe
-├── yt-dlp.exe
-└── vlc/
-    ├── vlc.exe
-    ├── libvlc.dll
-    ├── libvlccore.dll
-    └── plugins/
+|-- deno.exe
+|-- yt-dlp.exe
+`-- vlc/
+    |-- vlc.exe
+    |-- libvlc.dll
+    |-- libvlccore.dll
+    `-- plugins/
 ```
 
-The bundled versions are pinned to yt-dlp `2026.07.04`, Deno `2.8.1`, and VLC `3.0.23`.
-Existing files are reused on subsequent runs, and `bin/` is excluded from Git.
+Existing files are reused on later runs. The `bin/` directory is excluded from
+Git.
 
-## Quick start
+## CLI usage
 
-Open PowerShell in the project directory and pass a media-page URL:
+Pass a media-page URL:
 
 ```powershell
 python .\yt_vlc.py "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-Alternatively, start the script without a URL and paste one at the prompt:
+Run without a URL to enter one interactively:
 
 ```powershell
 python .\yt_vlc.py
 ```
 
-```text
-Media URL: https://www.youtube.com/watch?v=VIDEO_ID
-```
-
-To use a PowerShell variable:
-
-```powershell
-$URL = "https://www.youtube.com/watch?v=VIDEO_ID"
-python .\yt_vlc.py $URL
-```
-
-## Discord requests
-
-The optional Discord bot accepts `!play <URL>` and adds the request to a lazy
-playback queue. Run the bot on the same logged-in Windows session as VLC.
-
-1. Create an application and bot in the
-   [Discord Developer Portal](https://discord.com/developers/applications).
-2. On the bot settings page, enable **Message Content Intent**.
-3. Invite the bot with **View Channels**, **Send Messages**,
-   **Read Message History**, and **Manage Messages** permissions. Manage
-   Messages lets it remove sensitive debrid requests posted publicly.
-4. Install the Python dependency and create the local configuration:
-
-   ```powershell
-   python -m pip install -r .\requirements.txt
-   Copy-Item .\.env.example .\.env
-   ```
-
-5. Add the bot token to `.env`. If the bot belongs to exactly one server,
-   owner-only DM controls target it automatically. Set `DISCORD_GUILD_ID` when
-   the bot belongs to multiple servers. Optionally set
-   `DISCORD_REQUEST_CHANNEL_ID` for one server request channel. Logging defaults
-   to `INFO` in `logs/discord_bot.log`; use `DISCORD_LOG_LEVEL` to change the
-   verbosity or set `DISCORD_LOG_FILE=off` for console-only output. Bot-launched
-   VLC defaults to DirectSound for more reliable Discord application-audio
-   capture; set `VLC_AUDIO_OUTPUT` to `waveout`, `mmdevice`, or `automatic` to
-   choose another VLC output module.
-6. Start the bot:
-
-   ```powershell
-   python .\discord_bot.py
-   ```
-
-   Once Discord connects, the bot prepares its bundled tools and opens an idle
-   VLC window with the local controller ready. The first request can therefore
-   hand off media without waiting for VLC to launch.
-
-Request media from Discord:
-
-```text
-!play https://www.youtube.com/watch?v=VIDEO_ID
-```
-
-Playback commands:
-
-| Command | Behavior |
-|---|---|
-| `!play <URL>`, `!p <URL>` | Add a media URL to the lazy queue |
-| `!local`, `!localqueue`, `!media` | Interactively browse and queue files beneath `./media/` |
-| `!pause` | Pause the current item |
-| `!resume` | Resume the paused item |
-| `!skip`, `!s` | Advance to the next VLC playlist item or queued request |
-| `!seek <[+/-]seconds\|[+/-]MM:SS\|[+/-]HH:MM:SS>` | Seek absolutely, or move relative to the current time with `+`/`-` |
-| `!stop` | Stop playback and clear pending requests without closing VLC |
-| `!clear`, `!clearplaylist` | Remove VLC playlist items and all bot requests without closing VLC |
-| `!queue`, `!q` | Show bot requests plus VLC's live playlist and active item |
-
-Seek positions may be written as raw seconds (`!seek 90`), minutes and seconds
-(`!seek 01:30`), or hours, minutes, and seconds (`!seek 1:02:30`). Seeking
-beyond the current media duration is rejected. Prefix a value with `+` to move
-forward from the current playback time, such as `!seek +10`, `!seek +60`, or
-`!seek +05:00`. Prefix it with `-` to rewind, such as `!seek -10`, `!seek -60`,
-or `!seek -05:00`. Rewinding past the beginning lands at `0:00`. Values without
-a modifier remain absolute positions. `!skip` retains its queue-control behavior
-and always advances to the next request.
-
-`!queue` reads both the bot's lazy request queue and VLC's own live playlist.
-Files or network media added manually through VLC therefore appear even when
-they did not originate from `!play`, and VLC's actual active item is marked
-**Now playing**. Local folder paths and raw signed stream URLs are not exposed
-in Discord. `!seek` also operates on VLC's actual active item, so manually
-added files do not need a corresponding bot request. `!pause` and `!resume`
-likewise control VLC directly and work for `!local` files and manually added
-playlist items.
-
-`!clear` empties both sides shown by `!queue`: VLC's native playlist (including
-manually added files) and the bot's current and pending requests. The VLC window
-stays open so an active Discord screen share remains attached.
-
-### Local media browser
-
-Run `!local` to open a requester-scoped Discord menu rooted at `./media/`. The
-menu supports folder navigation, pagination, queueing one selected file, and
-recursively queueing every supported file in the current folder. Folder queues
-preserve alphabetical path order and append directly to the end of VLC's native
-playlist without interrupting or removing its active item. If VLC's playlist is
-empty, the bot explicitly starts playback after queueing. Recursive folder
-selections are sent to VLC as one folder input with recursive expansion enabled,
-rather than issuing a separate VLC request for every discovered file.
-
-The bot creates `./media/` when the command is first used. It recognizes common
-video and audio types including MP4, MKV, WebM, MOV, AVI, MP3, M4A, FLAC, WAV,
-OGG, and Opus. Paths are resolved and checked before browsing and again before
-playback; symlinks or selections that escape `./media/` are rejected. Discord
-messages show only `media/...` relative names, never absolute local paths. The
-folder is excluded from Git so local media cannot be committed accidentally.
-
-The commands work in the configured server and in direct messages from the
-Discord application owner. DM commands from every other account are rejected.
-When the bot belongs to one server, owner DMs automatically share that server's
-queue and VLC player.
-Queue displays and failure messages redact credential-bearing links from TorBox,
-Real-Debrid, AllDebrid, Premiumize, and similar debrid services. Ordinary social
-media and YouTube links remain visible.
-When a sensitive link is submitted in a server channel, the bot deletes the
-original command before queuing it. It refuses the request if deletion fails.
-Messages sent directly to the bot are already private and are not deleted.
-
-When yt-dlp reports a login, private-media, HTTP 401/403, or bot-verification
-failure, the failed request receives a **Retry with cookies.txt** button. Only
-the original requester can use it. The bot opens a DM and accepts one
-Netscape-format `.txt` cookie export within 60 seconds, up to 2 MiB. The upload
-is validated, filtered to domains associated with the requested site, and the
-Discord upload is deleted immediately. The retry returns to the lazy queue, so
-the media is not resolved until it reaches the front.
-
-Retry cookies are never installed as the bot's saved cookies. They remain in
-memory while queued, are written with private permissions to a temporary file
-only while yt-dlp resolves that retry, and are deleted afterward. If Discord
-cannot delete the uploaded DM, the bot warns the requester to remove it
-manually.
-
-Authenticated extraction can expose a different set of formats than the public
-attempt. Every resolution uses the bundled Deno runtime for yt-dlp's YouTube
-JavaScript challenge solver. If the normal quality selector is genuinely
-unavailable after cookie upload, the bot retries once with a flexible selector,
-preferring streams up to 1080p before allowing yt-dlp's broader compatibility
-fallbacks. The same temporary cookie file is used for both attempts and then
-removed.
-
-Each server has an independent in-memory `GuildState`. Requests enter as raw
-URLs. To shorten transitions without letting signed links age in the queue, the
-bot prepares only the next request when VLC reaches the final eight seconds of
-the current item. It never starts that item early. The bot keeps one VLC window
-open through a password-protected localhost interface, so a Discord screen share
-stays attached between requests. Reaching the end, pressing VLC's Stop button,
-or using `!skip` advances the queue; `!stop` clears the pending queue instead.
-
-When the bot connects, it waits up to 30 seconds for VLC's local controller to
-become ready before reporting warm-up completion in the log. If VLC opens
-without a working controller, the bot closes only that failed instance and
-retries once with fresh credentials and a new local port. A healthy session is
-reused across Discord reconnects and playback requests without restarting it.
-When the bot can see multiple guilds, set `DISCORD_GUILD_ID` so startup knows
-which guild state owns the single screen-shared VLC window.
-
-The console and rotating log file record bot startup, queue changes, resolution,
-VLC initialization and recovery, playback controls, and errors with tracebacks.
-Each log file is capped at 5 MiB with three backups. Sensitive TorBox,
-Real-Debrid, and similar debrid URLs are redacted from both normal entries and
-exception tracebacks.
-
-Discord screen-share audio uses VLC's `directsound` output by default. This
-avoids the automatic Windows multimedia output path that can become distorted
-for capture listeners even while local playback remains clear. If a particular
-Windows audio driver still crackles, set `VLC_AUDIO_OUTPUT=waveout` in `.env`
-and restart the bot. This setting changes only audio delivery to Windows and
-Discord; it does not change media quality, formats, or network caching.
-
-If playback time stops advancing for 12 seconds, the bot re-resolves the current
-request once with a combined-first 720p fallback and attempts to resume near the
-previous timestamp. Recovery is limited to one attempt so a bad source cannot
-loop indefinitely.
-
-## Format selection
-
-Available formats depend on the media and website. Inspect them with:
-
-```powershell
-.\bin\yt-dlp.exe -F "URL"
-```
-
-Pass a selector with `-f` or `--format`:
-
-```powershell
-python .\yt_vlc.py -f "bv*[height<=1080]+ba/b[height<=1080]" "URL"
-```
-
-| Selector | Behavior |
-|---|---|
-| `best` or `b` | Best combined video and audio stream |
-| `b[height>=720][height<=1080]/bv*[height<=1080]+ba/b[height<=1080]/b` | Combined at 720p+, otherwise separate streams up to 1080p |
-| `bestvideo+bestaudio` or `bv+ba` | Best separate video and audio streams |
-| `bestvideo*+bestaudio/best` | Best quality with a combined-stream fallback |
-| `bv*[height<=1080]+ba/b[height<=1080]` | Best stream up to 1080p |
-| `bv*[height<=720]+ba/b[height<=720]` | Best stream up to 720p |
-| `bestaudio` or `ba` | Best audio-only stream |
-| `worst` or `w` | Lowest-quality combined stream |
-| `bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]` | Prefer MP4 video and M4A audio |
-| `137+140` | Combine exact format IDs reported by `-F` |
-
-Selector operators:
-
-| Operator | Meaning |
-|---|---|
-| `+` | Combine separate streams |
-| `/` | Fall back to the next selector |
-| `[...]` | Filter by properties such as height, extension, or codec |
-
-The default selector is
-`b[height>=720][height<=1080]/bv*[height<=1080]+ba/b[height<=1080]/b`.
-
-## Command-line options
+### Options
 
 ```text
 usage: yt_vlc.py [-h] [-f FORMAT] [--yt-dlp PATH] [--deno PATH]
@@ -302,22 +105,22 @@ usage: yt_vlc.py [-h] [-f FORMAT] [--yt-dlp PATH] [--deno PATH]
 |---|---|
 | `url` | Media-page URL; prompted for when omitted |
 | `-f`, `--format FORMAT` | yt-dlp format selector |
-| `--yt-dlp PATH` | Override the bundled yt-dlp executable |
-| `--deno PATH` | Override the bundled Deno JavaScript runtime |
-| `--vlc PATH` | Override the bundled VLC executable |
-| `--print-only` | Print resolved URLs without launching VLC |
-| `-h`, `--help` | Show detailed, colorized command help |
+| `--yt-dlp PATH` | Use a specific yt-dlp executable |
+| `--deno PATH` | Use a specific Deno executable |
+| `--vlc PATH` | Use a specific VLC executable |
+| `--print-only` | Print resolved stream URLs without opening VLC |
+| `-h`, `--help` | Show the full colorized help message |
 
 Examples:
 
 ```powershell
-# Print the resolved network URL or URLs
+# Print the resolved stream URL or URLs
 python .\yt_vlc.py --print-only "URL"
 
 # Select exact video and audio format IDs
 python .\yt_vlc.py -f "137+140" "URL"
 
-# Use existing executable installations
+# Use existing tool installations
 python .\yt_vlc.py `
   --yt-dlp "C:\Tools\yt-dlp.exe" `
   --deno "C:\Tools\deno.exe" `
@@ -325,16 +128,229 @@ python .\yt_vlc.py `
   "URL"
 ```
 
+## Format selection
+
+Available formats depend on the media and extractor. Inspect them with:
+
+```powershell
+.\bin\yt-dlp.exe -F "URL"
+```
+
+Then pass a yt-dlp selector with `-f` or `--format`:
+
+```powershell
+python .\yt_vlc.py -f "bv*[height<=1080]+ba/b[height<=1080]" "URL"
+```
+
+| Selector | Behavior |
+|---|---|
+| `best` or `b` | Best combined video and audio stream |
+| `bestvideo+bestaudio` or `bv+ba` | Best separate video and audio streams |
+| `bestvideo*+bestaudio/best` | Best quality with a combined fallback |
+| `bv*[height<=1080]+ba/b[height<=1080]` | Best stream up to 1080p |
+| `bv*[height<=720]+ba/b[height<=720]` | Best stream up to 720p |
+| `bestaudio` or `ba` | Best audio-only stream |
+| `bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]` | Prefer MP4 video and M4A audio |
+| `137+140` | Combine exact format IDs reported by `-F` |
+
+The default selector is:
+
+```text
+b[height>=720][height<=1080]/bv*[height<=1080]+ba/b[height<=1080]/b
+```
+
+It prefers a combined stream between 720p and 1080p. If one is unavailable,
+it selects separate video and audio streams up to 1080p, followed by broader
+compatibility fallbacks.
+
+## Discord bot
+
+The optional Discord bot turns the VLC instance into a requestable player. It
+maintains a lazy URL queue, exposes playback controls, and can browse trusted
+local media beneath `./media`.
+
+### Setup
+
+1. Create an application and bot in the
+   [Discord Developer Portal](https://discord.com/developers/applications).
+2. Enable **Message Content Intent** on the bot page.
+3. Invite the bot with these permissions:
+   - View Channels
+   - Send Messages
+   - Read Message History
+   - Manage Messages
+4. Copy the example configuration:
+
+   ```powershell
+   Copy-Item .\.env.example .\.env
+   ```
+
+5. Add your Discord bot token to `.env`:
+
+   ```dotenv
+   DISCORD_BOT_TOKEN=
+   ```
+
+6. Start the bot:
+
+   ```powershell
+   .\start.bat
+   ```
+
+   You can also run `python .\discord_bot.py` from an activated environment.
+
+At startup, the bot prepares its bundled tools and opens an idle VLC window.
+Share that VLC application in Discord once; the same window remains open across
+requests and playlist changes.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DISCORD_BOT_TOKEN` | Required | Discord bot token |
+| `DISCORD_GUILD_ID` | Auto when only one guild is visible | Guild controlled by owner-only DM commands and the shared VLC instance |
+| `DISCORD_REQUEST_CHANNEL_ID` | Any allowed guild channel | Restrict guild commands to one channel |
+| `DISCORD_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
+| `DISCORD_LOG_FILE` | `logs/discord_bot.log` | Rotating log path; use `off` for console-only logging |
+| `VLC_AUDIO_OUTPUT` | `directsound` | VLC audio module: `directsound`, `waveout`, `mmdevice`, or `automatic` |
+
+Never commit `.env`. It is excluded by the repository's `.gitignore`.
+
+### Commands
+
+| Command | Behavior |
+|---|---|
+| `!play <URL>`, `!p <URL>` | Add a media URL to the lazy queue |
+| `!local`, `!localqueue`, `!media` | Browse and queue files beneath `./media` |
+| `!pause` | Pause the active VLC item |
+| `!resume` | Resume the active VLC item |
+| `!skip`, `!s` | Advance to the next VLC playlist item or queued request |
+| `!seek <position>` | Seek absolutely or relative to the current time |
+| `!stop` | Stop playback and clear pending bot requests without closing VLC |
+| `!clear`, `!clearplaylist` | Clear the VLC playlist and all bot requests without closing VLC |
+| `!queue`, `!q` | Show the bot queue and VLC's live playlist |
+
+Seek values accept seconds, `MM:SS`, or `HH:MM:SS`:
+
+```text
+!seek 90       # absolute: 1:30
+!seek 01:30    # absolute: 1:30
+!seek +10      # forward 10 seconds
+!seek -05:00   # back 5 minutes
+```
+
+Playback commands operate on VLC itself, so pause, resume, seek, queue, and
+clear also work with files added manually through VLC.
+
+### Local media
+
+Run `!local` to open a requester-scoped browser rooted at `./media`. The bot
+creates this directory when needed and supports common video and audio formats,
+including MP4, MKV, WebM, MOV, AVI, MP3, M4A, FLAC, WAV, OGG, and Opus.
+
+The browser supports:
+
+- Folder navigation and pagination
+- Queueing individual files
+- Queueing an entire folder recursively in one VLC operation
+- Appending to VLC without replacing its active playlist
+- Starting the first new item automatically when VLC is idle
+
+Every selected path is resolved beneath `./media` before use. Paths that escape
+the directory are rejected, and absolute local paths are not shown in Discord.
+The directory is excluded from Git to prevent accidental media commits.
+
+### Queue behavior
+
+Each guild has an independent in-memory request state. URLs remain unresolved
+until they reach the front of the queue, which prevents signed stream URLs from
+expiring while they wait. Near the end of the active item, the bot may prepare
+only the next request to reduce transition time.
+
+`!queue` combines the bot's pending requests with VLC's native playlist, so it
+also reflects files or streams added outside Discord. Discord embeds are
+truncated safely when a playlist is too long for one message.
+
+## Privacy and security
+
+- `.env`, logs, downloaded tools, local media, and Python environments are
+  excluded from Git.
+- VLC's control interface binds to `127.0.0.1` and uses a newly generated
+  password for each bot launch.
+- Owner-only DM commands can control the configured guild; DMs from other users
+  are rejected.
+- Credential-bearing TorBox, Real-Debrid, AllDebrid, Premiumize, and similar
+  URLs are redacted from Discord responses, queue displays, and logs.
+- Public commands containing a sensitive link are deleted before the request is
+  accepted. The request is rejected if deletion fails.
+- Cookie retries accept one requester-scoped Netscape `cookies.txt` upload in
+  DM. It is filtered to the requested service and used for one retry. The bot
+  deletes the upload immediately when Discord permits it and warns the requester
+  if manual deletion is required.
+
+Cookie files and authenticated stream URLs are sensitive. Use a dedicated bot,
+limit its permissions to the intended server, and rotate credentials if they
+are ever exposed.
+
 ## How it works
 
-1. The script ensures its pinned tools are available under `./bin`.
-2. yt-dlp resolves the supplied page using `--no-playlist`, the selected
-   format, `-g`, and the bundled Deno runtime for JavaScript challenges.
-3. A single URL is opened directly in VLC. If VLC is already running, its
-   current item is replaced instead of opening another player window.
-4. If two URLs are returned, the first is treated as video and the second as
-   audio and attached through VLC's item-specific `:input-slave` option.
+1. The program ensures the pinned tools exist beneath `./bin`.
+2. yt-dlp resolves the page with `--no-playlist`, `-g`, the selected format,
+   and the bundled Deno runtime.
+3. A combined stream is opened directly in VLC, or separate audio is attached
+   to the video through VLC's item-specific `input-slave` option.
+4. CLI launches reuse the existing VLC instance and replace its current item.
+5. The Discord bot instead keeps a dedicated VLC process and controls its
+   playlist through VLC's password-protected local HTTP interface.
 
-The script passes `--one-instance` and `--no-playlist-enqueue` to VLC. This
-makes repeat runs behave like media requests: the new item starts immediately
-in the existing player rather than being queued or opened in another window.
+## Troubleshooting
+
+### The requested format is unavailable
+
+List the source's formats with `yt-dlp -F`, then choose a compatible selector
+with `-f`. Availability can differ for public and authenticated extraction.
+
+### VLC opens but the Discord bot cannot control it
+
+The bot waits for VLC's local interface and retries initialization once with a
+new port and password. Check `logs/discord_bot.log` for the underlying error and
+confirm no security software is blocking localhost connections.
+
+### Discord viewers hear distorted audio
+
+The bot defaults to DirectSound for application-audio capture. If distortion
+continues, set this in `.env` and restart the bot:
+
+```dotenv
+VLC_AUDIO_OUTPUT=waveout
+```
+
+### Playback stalls
+
+If playback time stops advancing for 12 seconds, the bot makes one recovery
+attempt with a combined-first 720p compatibility selector and resumes near the
+previous timestamp when possible.
+
+## Development
+
+Run the test suite from the repository root:
+
+```powershell
+python -m unittest tests.test_discord_bot
+```
+
+The current suite covers queue behavior, VLC control, seeking, local media,
+cookie retry handling, sensitive-link redaction, and playback recovery.
+
+## Contributing
+
+Bug reports and focused pull requests are welcome. Please describe the playback
+source, expected behavior, actual behavior, and relevant redacted log output.
+Never include authentication cookies, bot tokens, signed media URLs, or private
+local paths in an issue.
+
+## Responsible use
+
+This project is a playback helper around yt-dlp and VLC. Supported sites and
+formats can change over time. Use it only with media you are authorized to
+access, and follow the applicable service terms and local laws.
