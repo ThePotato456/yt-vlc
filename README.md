@@ -220,7 +220,7 @@ Never commit `.env`. It is excluded by the repository's `.gitignore`.
 
 | Command | Behavior |
 |---|---|
-| `!play <URL>`, `!p <URL>` | Add a media URL to the lazy queue |
+| `!play <URL> [URL ...]`, `!p <URL> [URL ...]` | Add one or more media URLs to the lazy queue in order |
 | `!local`, `!localqueue`, `!media` | Browse and queue files beneath `./media` |
 | `!pause` | Pause the active VLC item |
 | `!resume` | Resume the active VLC item |
@@ -241,6 +241,14 @@ Seek values accept seconds, `MM:SS`, or `HH:MM:SS`:
 
 Playback commands operate on VLC itself, so pause, resume, seek, queue, and
 clear also work with files added manually through VLC.
+
+Queue multiple links in one command by separating them with spaces. The bot
+validates the complete batch first, then adds up to 25 links in the exact order
+provided:
+
+```text
+!play https://example.com/first https://example.com/second https://example.com/third
+```
 
 ### Local media
 

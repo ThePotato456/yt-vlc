@@ -560,6 +560,81 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(context.message.deleted)
         self.assertIn("Resolving request", context.replies[-1])
 
+    async def test_play_queues_multiple_links_in_the_given_order(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        command = bot.get_command("play")
+        self.assertIsNotNone(command)
+        context = FakeContext()
+        urls = [
+            "https://example.com/first",
+            "https://example.com/second",
+            "https://example.com/third",
+        ]
+
+        with patch.object(discord_bot, "ensure_guild_worker") as ensure_worker:
+            await command.callback(  # type: ignore[arg-type, union-attr]
+                context,
+                url=" ".join(urls),
+            )
+
+        state = discord_bot.GUILD_STATE.pop(123)
+        queued = [state.queue.get_nowait() for _ in urls]
+        for _ in queued:
+            state.queue.task_done()
+        self.assertEqual([request.url for request in queued], urls)
+        self.assertEqual(
+            context.replies,
+            [
+                "Resolving request 1/3…",
+                "Queued request 2/3 at position 2.",
+                "Queued request 3/3 at position 3.",
+            ],
+        )
+        ensure_worker.assert_called_once_with(state)
+
+    async def test_multi_play_deletes_public_message_when_any_link_is_sensitive(
+        self,
+    ) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        command = bot.get_command("play")
+        self.assertIsNotNone(command)
+        context = FakeContext()
+        public_url = "https://www.youtube.com/watch?v=public-video"
+        private_url = "https://nexus-220.cnam.tb-cdn.io/file?token=secret"
+
+        with patch.object(discord_bot, "ensure_guild_worker"):
+            await command.callback(  # type: ignore[arg-type, union-attr]
+                context,
+                url=f"{public_url} {private_url}",
+            )
+
+        state = discord_bot.GUILD_STATE.pop(123)
+        queued = [state.queue.get_nowait(), state.queue.get_nowait()]
+        for _ in queued:
+            state.queue.task_done()
+        self.assertTrue(context.message.deleted)
+        self.assertEqual([request.url for request in queued], [public_url, private_url])
+        self.assertEqual(context.replies, [])
+        self.assertEqual(len(context.sent), 2)
+
+    async def test_multi_play_rejects_the_entire_batch_when_one_link_is_invalid(
+        self,
+    ) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        command = bot.get_command("play")
+        self.assertIsNotNone(command)
+        context = FakeContext()
+
+        with patch.object(discord_bot, "ensure_guild_worker") as ensure_worker:
+            await command.callback(  # type: ignore[arg-type, union-attr]
+                context,
+                url="https://example.com/valid not-a-url",
+            )
+
+        self.assertNotIn(123, discord_bot.GUILD_STATE)
+        self.assertIn("Link 2:", context.replies[-1])
+        ensure_worker.assert_not_called()
+
     def test_sensitive_debrid_links_are_redacted_but_social_links_are_not(self) -> None:
         sensitive = "https://api.torbox.app/v1/download?token=super-secret"
         torbox_cdn = (

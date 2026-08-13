@@ -37,6 +37,7 @@ DEFAULT_LOG_FILE = APP_DIR / "logs" / "discord_bot.log"
 COMMAND_PREFIX = "!"
 MAX_DISCORD_TEXT = 1_000
 MAX_QUEUE_EMBED_DESCRIPTION = 4_000
+MAX_PLAY_URLS = 25
 MAX_TEMP_COOKIE_BYTES = 2 * 1024 * 1024
 COOKIE_UPLOAD_TIMEOUT = 60.0
 VLC_START_TIMEOUT = 30.0
@@ -947,6 +948,23 @@ def validate_media_url(value: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("Provide a complete http:// or https:// media URL.")
     return url
+
+
+def parse_media_urls(value: str) -> list[str]:
+    """Validate a whitespace-separated, ordered batch of media URLs."""
+    candidates = value.split()
+    if not candidates:
+        raise ValueError("Provide at least one complete http:// or https:// media URL.")
+    if len(candidates) > MAX_PLAY_URLS:
+        raise ValueError(f"A single play command accepts up to {MAX_PLAY_URLS} links.")
+
+    urls: list[str] = []
+    for index, candidate in enumerate(candidates, start=1):
+        try:
+            urls.append(validate_media_url(candidate))
+        except ValueError as error:
+            raise ValueError(f"Link {index}: {error}") from error
+    return urls
 
 
 def cookie_target_for_url(url: str) -> str | None:
@@ -2003,17 +2021,16 @@ def build_bot(
 
     @bot.command(name="play", aliases=["request", "p"])
     async def play_command(ctx: commands.Context[commands.Bot], *, url: str) -> None:
-        """Queue a URL for lazy VLC playback."""
+        """Queue one or more URLs for lazy VLC playback in the given order."""
         if not await allowed_context(ctx):
-            return
-        try:
-            media_url = validate_media_url(url)
-        except ValueError as error:
-            await ctx.reply(str(error), mention_author=False)
             return
 
         source_deleted = False
-        if ctx.guild is not None and is_sensitive_link(media_url):
+        raw_urls = [candidate.strip("<>") for candidate in url.split()]
+        contains_sensitive_link = any(
+            is_sensitive_link(candidate) for candidate in raw_urls
+        )
+        if ctx.guild is not None and contains_sensitive_link:
             try:
                 await ctx.message.delete()
                 source_deleted = True
@@ -2033,32 +2050,52 @@ def build_bot(
                 )
                 return
 
+        try:
+            media_urls = parse_media_urls(url)
+        except ValueError as error:
+            if source_deleted:
+                await ctx.send(str(error))
+            else:
+                await ctx.reply(str(error), mention_author=False)
+            return
+
         state = get_guild_state(target_guild_id(ctx))
-        position = state.queue.qsize() + (1 if state.current else 0) + 1
-        status_text = (
-            "Resolving request…"
-            if position == 1
-            else f"Queued at position {position}."
-        )
-        if source_deleted:
-            progress = await ctx.send(status_text)
-        else:
-            progress = await ctx.reply(status_text, mention_author=False)
-        await state.queue.put(
-            MediaRequest(
-                url=media_url,
-                requester=ctx.author,
-                status_message=progress,
-                bot=bot,
+        first_position = state.queue.qsize() + (1 if state.current else 0) + 1
+        queued_requests: list[MediaRequest] = []
+        batch_size = len(media_urls)
+        for offset, media_url in enumerate(media_urls):
+            position = first_position + offset
+            batch_label = f" {offset + 1}/{batch_size}" if batch_size > 1 else ""
+            status_text = (
+                f"Resolving request{batch_label}…"
+                if position == 1
+                else f"Queued request{batch_label} at position {position}."
             )
-        )
+            if source_deleted:
+                progress = await ctx.send(status_text)
+            else:
+                progress = await ctx.reply(status_text, mention_author=False)
+            queued_requests.append(
+                MediaRequest(
+                    url=media_url,
+                    requester=ctx.author,
+                    status_message=progress,
+                    bot=bot,
+                )
+            )
+
+        for request in queued_requests:
+            await state.queue.put(request)
         LOGGER.info(
-            "Queued request guild=%s requester=%s position=%s source_deleted=%s url=%s",
+            "Queued request batch guild=%s requester=%s count=%s positions=%s-%s "
+            "source_deleted=%s urls=%s",
             state.guild_id,
             getattr(ctx.author, "id", "unknown"),
-            position,
+            batch_size,
+            first_position,
+            first_position + batch_size - 1,
             source_deleted,
-            media_url,
+            media_urls,
         )
         ensure_guild_worker(state)
 
@@ -2071,7 +2108,7 @@ def build_bot(
             return
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.reply(
-                f"Usage: `{COMMAND_PREFIX}play <media URL>`",
+                f"Usage: `{COMMAND_PREFIX}play <URL> [URL ...]`",
                 mention_author=False,
             )
             return
