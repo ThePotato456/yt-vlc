@@ -49,7 +49,7 @@ VLC_POLL_INTERVAL = 0.5
 VLC_STALL_TIMEOUT = 12.0
 VLC_PLAYLIST_UPDATE_TIMEOUT = 5.0
 VLC_PLAYLIST_UPDATE_POLL_INTERVAL = 0.1
-DEFAULT_VLC_AUDIO_OUTPUT = "directsound"
+DEFAULT_VLC_AUDIO_OUTPUT = "mmdevice"
 VLC_AUDIO_OUTPUTS = {"automatic", "directsound", "mmdevice", "waveout"}
 QUEUE_PREFETCH_SECONDS = 8.0
 LOCAL_BROWSER_PAGE_SIZE = 20
@@ -459,6 +459,7 @@ class VLCSession:
         self.port = self._available_port()
         self.password = secrets.token_urlsafe(24)
         audio_output = configured_vlc_audio_output()
+
         command = [
             self.executable,
             "--no-one-instance",
@@ -470,19 +471,31 @@ class VLCSession:
             "--no-qt-privacy-ask",
             "--no-video-title-show",
         ]
+
         if audio_output is not None:
             command.append(f"--aout={audio_output}")
+
+        # When using Windows MMDevice, explicitly select
+        # CABLE Input (VB-Audio Virtual Cable).
+        if audio_output == "mmdevice":
+            command.append(
+                f"--mmdevice-audio-device={yt_vlc.VLC_AUDIO_DEVICE}"
+            )
+
         self.process = subprocess.Popen(
             command,
             cwd=Path(self.executable).parent,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
         LOGGER.info(
-            "Started VLC process pid=%s with controller port=%s audio_output=%s",
+            "Started VLC process pid=%s with controller port=%s "
+            "audio_output=%s audio_device=%s",
             self.process.pid,
             self.port,
             audio_output or "automatic",
+            yt_vlc.VLC_AUDIO_DEVICE if audio_output == "mmdevice" else "default",
         )
 
     def _ensure_started(self) -> None:

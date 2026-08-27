@@ -29,6 +29,10 @@ YT_DLP_URL = (
     "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp.exe"
 )
 VLC_URL = "https://get.videolan.org/vlc/3.0.23/win64/vlc-3.0.23-win64.zip"
+VLC_AUDIO_DEVICE = (
+    "{0.0.0.00000000}.{C57B4F31-DD70-4FF3-A187-2F48284FD193}"
+)
+
 DENO_VERSION = "2.8.1"
 DENO_URL = (
     "https://github.com/denoland/deno/releases/download/"
@@ -546,18 +550,34 @@ def resolve_streams(
 
 
 def vlc_command(vlc: str, streams: list[str]) -> list[str]:
-    # Reuse the active VLC instance and replace its current item. The audio slave
-    # is item-specific so it survives VLC's inter-process playlist handoff.
+    """Build the VLC command and route playback through VB-CABLE."""
+
     command = [
         vlc,
+
+        # Reuse the existing VLC instance when one is already running.
         "--one-instance",
+
+        # Replace the current item instead of appending to VLC's playlist.
         "--no-playlist-enqueue",
+
+        # Force VLC to use the Windows MMDevice/Core Audio output backend.
+        "--aout=mmdevice",
+
+        # Route VLC audio specifically to:
+        # CABLE Input (VB-Audio Virtual Cable)
+        f"--mmdevice-audio-device={VLC_AUDIO_DEVICE}",
+
+        # Primary video or combined video/audio stream.
         streams[0],
     ]
+
+    # yt-dlp can return separate video and audio URLs.
+    # In that case, attach the second URL as VLC's audio input slave.
     if len(streams) == 2:
         command.append(f":input-slave={streams[1]}")
-    return command
 
+    return command
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
