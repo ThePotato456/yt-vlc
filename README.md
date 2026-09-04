@@ -16,7 +16,7 @@ video and audio streams without downloading the complete file first.
 | Mode | Best for |
 |---|---|
 | CLI | Opening a URL directly in VLC from PowerShell |
-| Discord bot | Running a requestable VLC player that stays attached to a Discord screen share |
+| Discord bot | Running a requestable VLC player with optional automatic Canary sharing |
 
 ## Highlights
 
@@ -206,15 +206,41 @@ sharing.
    VLC_AUDIO_DEVICE=CABLE Input
    ```
 
-7. Start the bot:
+7. To have the logged-in Discord Canary account automatically join and share
+   VLC, install the bundled `vencord-plugin/ytVlcRemote.desktop` userplugin:
+
+   - Use a current Vencord checkout and link or copy the directory to
+     `Vencord/src/userplugins/ytVlcRemote.desktop`.
+   - Build Vencord and inject that build into **Discord Canary**, then enable
+     **YtVlcRemote** and restart Canary.
+   - In the plugin settings, copy the generated bearer token.
+   - Enable Developer Mode in Discord, right-click the target ordinary guild
+     voice channel, and copy its ID.
+   - Add the client settings to `.env`:
+
+     ```dotenv
+     DISCORD_CLIENT_API_URL=http://127.0.0.1:38423
+     DISCORD_CLIENT_API_TOKEN=the-token-copied-from-canary
+     DISCORD_VOICE_CHANNEL_ID=234567890123456789
+     ```
+
+   Do not install this userplugin into Discord Stable. The native server also
+   refuses to start unless its host executable is Discord Canary.
+
+8. Start the bot:
 
    ```powershell
    .\start.bat
    ```
 
-At startup, the bot prepares its tools and opens an idle VLC window. Share the
-VLC application in Discord once; requests and playlist changes continue using
-that same window.
+At startup, the bot prepares its tools and opens an idle VLC window. When the
+client bridge is configured, it asks Canary once to join the configured voice
+channel, self-mute/deafen, and share that exact bot-owned VLC window with audio
+at 720p/30 FPS. Failures retry in the background after 1, 2, 5, 10, and then
+30-second intervals, so bot commands remain usable. A replacement VLC PID
+triggers a fresh request. After successful setup, a manual disconnect is not
+continuously reversed, and stopping the bot does not leave voice or stop the
+stream.
 
 ### Audio routing
 
@@ -233,6 +259,9 @@ MMDevice endpoint ID. Restart the bot after changing audio settings.
 | `DISCORD_BOT_TOKEN` | Required | Discord bot token |
 | `DISCORD_GUILD_ID` | Automatic for one visible guild | Guild controlled by commands sent in that guild or by owner-only DMs |
 | `DISCORD_REQUEST_CHANNEL_ID` | Any allowed guild channel | Restrict public commands to one channel |
+| `DISCORD_CLIENT_API_URL` | `http://127.0.0.1:38423` | IPv4-loopback YtVlcRemote endpoint; only used when token and voice channel are set |
+| `DISCORD_CLIENT_API_TOKEN` | Disabled | Bearer token copied from the Canary plugin settings |
+| `DISCORD_VOICE_CHANNEL_ID` | Disabled | Ordinary guild voice channel joined by the logged-in Canary account |
 | `DISCORD_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
 | `DISCORD_LOG_FILE` | `logs/discord_bot.log` | Rotating log path; use `off` for console-only logging |
 | `VLC_AUDIO_OUTPUT` | `mmdevice` | VLC audio module: `mmdevice`, `directsound`, `waveout`, or `automatic` |
@@ -304,6 +333,12 @@ excluded from Git.
   excluded from Git.
 - VLC's control interface binds to `127.0.0.1` and receives a new random
   password on each bot launch.
+- The optional Canary bridge binds only to IPv4 loopback, requires a generated
+  bearer token, rejects browser Origin and unexpected Host requests, limits
+  request size and queue depth, and never returns thumbnails or signed URLs.
+- Screen sharing requires an exact match between the bot-owned VLC PID,
+  executable path, Windows main-window handle, and a window capture source.
+  Full-display fallback is intentionally absent.
 - Owner-only DM commands can control the configured guild; other DM users are
   rejected.
 - Credential-bearing TorBox, Real-Debrid, AllDebrid, Premiumize, and similar
@@ -356,6 +391,32 @@ Verify that Windows, VB-CABLE, and the receiving application use compatible
 sample-rate and channel settings. Keep the MMDevice route configured so VLC
 does not move back to the default output while troubleshooting.
 
+### The Canary client bridge is unavailable
+
+Confirm Canary is running, YtVlcRemote is enabled, Canary was restarted after a
+port change, and `DISCORD_CLIENT_API_URL` uses the same port. Another process
+may already own port `38423`; choose an unused port in the plugin settings,
+restart Canary, and update `.env`.
+
+### The bridge returns `unauthorized`
+
+Copy the token again from YtVlcRemote settings. Regenerating it invalidates the
+old value immediately. Keep it out of logs, screenshots, commits, and chat.
+
+### The bridge cannot find VLC
+
+The plugin accepts only the exact `vlc.exe` PID and executable path supplied by
+this bot. Wait for the idle VLC window to appear and ensure it is not minimized
+to the notification area. A display will never be substituted for a missing
+VLC window.
+
+### Discord voice or Go Live APIs are unavailable
+
+Discord's renderer internals can change. Update Vencord, rebuild the userplugin,
+and restart Canary. The REST bridge returns `discord_api_unavailable` rather
+than attempting unknown internals. Also confirm the account has View Channel,
+Connect, and Stream permission in an ordinary guild voice channel.
+
 ### Playback stalls
 
 If playback time stops advancing for 12 seconds, the bot makes one recovery
@@ -367,11 +428,13 @@ previous timestamp when possible.
 Run the test suite from the repository root:
 
 ```powershell
-python -m unittest tests.test_discord_bot
+python -m unittest discover -s tests -v
 ```
 
 The suite covers queue behavior, VLC control, audio routing, seeking, local
-media, cookie retries, sensitive-link redaction, and playback recovery.
+media, cookie retries, sensitive-link redaction, playback recovery, bridge
+configuration and authentication, retry scheduling, duplicate-ready
+suppression, and VLC PID replacement.
 
 ## Contributing
 

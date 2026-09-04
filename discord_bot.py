@@ -27,6 +27,7 @@ from urllib.request import Request, urlopen
 import discord
 from discord.ext import commands
 
+import client_bridge
 import yt_vlc
 
 
@@ -52,6 +53,7 @@ VLC_PLAYLIST_UPDATE_POLL_INTERVAL = 0.1
 DEFAULT_VLC_AUDIO_OUTPUT = "mmdevice"
 VLC_AUDIO_OUTPUTS = {"automatic", "directsound", "mmdevice", "waveout"}
 QUEUE_PREFETCH_SECONDS = 8.0
+CLIENT_BRIDGE_RETRY_DELAYS = (1.0, 2.0, 5.0, 10.0, 30.0)
 LOCAL_BROWSER_PAGE_SIZE = 20
 LOCAL_MEDIA_EXTENSIONS = {
     ".3gp",
@@ -751,6 +753,10 @@ class GuildState:
     completion_note: str | None = None
     cancel_current: bool = False
     prefetch: PrefetchedRequest | None = None
+    client_bridge: client_bridge.ClientBridge | None = field(default=None, repr=False)
+    client_bridge_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    client_bridge_target_pid: int | None = None
+    client_bridge_confirmed_pid: int | None = None
 
 
 class CookieRetryView(discord.ui.View):
@@ -1295,6 +1301,117 @@ def get_guild_state(guild_id: int) -> GuildState:
     return state
 
 
+def active_vlc_process(state: GuildState) -> tuple[int, str] | None:
+    """Return the bot-owned VLC identity when its process is still running."""
+    if state.vlc is None or state.vlc.process is None:
+        return None
+    if state.vlc.process.poll() is not None:
+        return None
+    return state.vlc.process.pid, state.vlc.executable
+
+
+async def run_client_session_setup(state: GuildState, pid: int, executable: str) -> None:
+    """Retry one desired client session until confirmed or the VLC PID changes."""
+    assert state.client_bridge is not None
+    retry_index = 0
+    while True:
+        current = active_vlc_process(state)
+        if current is None or current[0] != pid:
+            return
+        try:
+            await asyncio.to_thread(
+                state.client_bridge.ensure_session,
+                guild_id=state.guild_id,
+                vlc_pid=pid,
+                vlc_executable=executable,
+            )
+        except asyncio.CancelledError:
+            raise
+        except client_bridge.ClientBridgeError as error:
+            delay = CLIENT_BRIDGE_RETRY_DELAYS[
+                min(retry_index, len(CLIENT_BRIDGE_RETRY_DELAYS) - 1)
+            ]
+            retry_index += 1
+            LOGGER.warning(
+                "Discord client session setup failed guild=%s pid=%s code=%s; "
+                "retrying in %.0fs",
+                state.guild_id,
+                pid,
+                error.code,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+        except Exception:
+            delay = CLIENT_BRIDGE_RETRY_DELAYS[
+                min(retry_index, len(CLIENT_BRIDGE_RETRY_DELAYS) - 1)
+            ]
+            retry_index += 1
+            LOGGER.warning(
+                "Unexpected Discord client session setup failure guild=%s pid=%s; "
+                "retrying in %.0fs",
+                state.guild_id,
+                pid,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        if active_vlc_process(state) == (pid, executable):
+            state.client_bridge_confirmed_pid = pid
+            LOGGER.info(
+                "Discord client session confirmed guild=%s pid=%s",
+                state.guild_id,
+                pid,
+            )
+        return
+
+
+async def run_client_session_after(
+    previous: asyncio.Task[None],
+    state: GuildState,
+    pid: int,
+    executable: str,
+) -> None:
+    """Preserve single-flight behavior while switching to a replacement PID."""
+    try:
+        await previous
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+    await run_client_session_setup(state, pid, executable)
+
+
+def schedule_client_session(state: GuildState) -> None:
+    """Start one nonblocking setup loop for the current VLC process."""
+    if state.client_bridge is None:
+        return
+    current = active_vlc_process(state)
+    if current is None:
+        return
+    pid, executable = current
+    if state.client_bridge_confirmed_pid == pid:
+        return
+    if (
+        state.client_bridge_task is not None
+        and not state.client_bridge_task.done()
+        and state.client_bridge_target_pid == pid
+    ):
+        return
+    state.client_bridge_target_pid = pid
+    previous = state.client_bridge_task
+    coroutine = (
+        run_client_session_after(previous, state, pid, executable)
+        if previous is not None and not previous.done()
+        else run_client_session_setup(state, pid, executable)
+    )
+    state.client_bridge_task = asyncio.create_task(
+        coroutine,
+        name=f"yt-vlc-client-session-{state.guild_id}-{pid}",
+    )
+
+
 def pending_requests(state: GuildState) -> tuple[MediaRequest, ...]:
     """Return a stable display snapshot without removing queue entries."""
     return tuple(state.queue._queue)  # type: ignore[attr-defined]
@@ -1534,6 +1651,7 @@ async def run_guild_queue(state: GuildState) -> None:
 
             await request.status_message.edit(content="Starting VLC…", embed=None)
             initial_status = await asyncio.to_thread(state.vlc.play, media)
+            schedule_client_session(state)
             if state.cancel_current:
                 await asyncio.to_thread(state.vlc.stop)
                 await request.status_message.edit(
@@ -1583,6 +1701,7 @@ async def run_guild_queue(state: GuildState) -> None:
                     )
                     continue
                 initial_status = await asyncio.to_thread(state.vlc.play, media)
+                schedule_client_session(state)
                 if state.cancel_current:
                     await asyncio.to_thread(state.vlc.stop)
                     await request.status_message.edit(
@@ -1807,6 +1926,7 @@ class LocalMediaBrowserView(discord.ui.View):
                 self.state.vlc.enqueue_local_inputs,
                 resolved_paths,
             )
+            schedule_client_session(self.state)
         except (OSError, RuntimeError, ValueError) as error:
             LOGGER.exception(
                 "Could not append local media guild=%s requester=%s",
@@ -1942,6 +2062,7 @@ async def warm_up_vlc(state: GuildState) -> None:
 def build_bot(
     request_channel_id: int | None,
     configured_guild_id: int | None,
+    client_api: client_bridge.ClientBridge | None = None,
 ) -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
@@ -2015,8 +2136,11 @@ def build_bot(
             )
             return
         async with vlc_warmup_lock:
+            state = get_guild_state(warmup_guild_id)
+            state.client_bridge = client_api
             try:
-                await warm_up_vlc(get_guild_state(warmup_guild_id))
+                await warm_up_vlc(state)
+                schedule_client_session(state)
             except (OSError, RuntimeError, ValueError):
                 LOGGER.exception(
                     "VLC playback warm-up failed guild=%s; the first request "
@@ -2482,7 +2606,13 @@ def main() -> int:
     try:
         configured_guild_id = optional_snowflake("DISCORD_GUILD_ID")
         request_channel_id = optional_snowflake("DISCORD_REQUEST_CHANNEL_ID")
-        bot = build_bot(request_channel_id, configured_guild_id)
+        bridge_config = client_bridge.load_client_bridge_config()
+        client_api = (
+            client_bridge.ClientBridge(bridge_config)
+            if bridge_config is not None
+            else None
+        )
+        bot = build_bot(request_channel_id, configured_guild_id, client_api)
         LOGGER.info("Starting Discord bot")
         bot.run(token, log_handler=None)
         LOGGER.info("Discord bot stopped")
