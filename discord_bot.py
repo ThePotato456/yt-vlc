@@ -2085,6 +2085,15 @@ def build_bot(
             return bot.guilds[0].id
         return None
 
+    def startup_target_guild_id() -> int | None:
+        guild_id = dm_target_guild_id()
+        if guild_id is not None or client_api is None:
+            return guild_id
+        channel = bot.get_channel(client_api.voice_channel_id)
+        guild = getattr(channel, "guild", None)
+        inferred_id = getattr(guild, "id", None)
+        return inferred_id if isinstance(inferred_id, int) else None
+
     async def allowed_context(ctx: commands.Context[commands.Bot]) -> bool:
         if ctx.guild is None:
             if not await bot.is_owner(ctx.author):
@@ -2122,11 +2131,11 @@ def build_bot(
             guild_note,
             channel_note,
         )
-        warmup_guild_id = dm_target_guild_id()
+        warmup_guild_id = startup_target_guild_id()
         if warmup_guild_id is None:
             LOGGER.warning(
-                "VLC warm-up skipped because no single target guild is available; "
-                "set DISCORD_GUILD_ID"
+                "VLC warm-up skipped because no target guild is available; set "
+                "DISCORD_GUILD_ID or ensure DISCORD_VOICE_CHANNEL_ID is visible"
             )
             return
         if bot.get_guild(warmup_guild_id) is None:

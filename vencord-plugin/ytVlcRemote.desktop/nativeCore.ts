@@ -41,6 +41,44 @@ export function positiveInteger(value: unknown, field: string): number {
     return Number(value);
 }
 
+export function windowsProcessQuery(pidValue: unknown): string {
+    const pid = positiveInteger(pidValue, "pid");
+    return [
+        "$ErrorActionPreference='Stop'",
+        "Add-Type -TypeDefinition @'",
+        "using System;",
+        "using System.Collections.Generic;",
+        "using System.Runtime.InteropServices;",
+        "using System.Text;",
+        "public sealed class YtVlcWindowInfo { public long Handle { get; set; } public string Title { get; set; } }",
+        "public static class YtVlcWindowLookup {",
+        "  private delegate bool EnumWindowsProc(IntPtr handle, IntPtr state);",
+        "  [DllImport(\"user32.dll\")] private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr state);",
+        "  [DllImport(\"user32.dll\")] private static extern bool IsWindowVisible(IntPtr handle);",
+        "  [DllImport(\"user32.dll\")] private static extern IntPtr GetWindow(IntPtr handle, uint command);",
+        "  [DllImport(\"user32.dll\")] private static extern uint GetWindowThreadProcessId(IntPtr handle, out uint processId);",
+        "  [DllImport(\"user32.dll\", CharSet=CharSet.Unicode)] private static extern int GetWindowTextLength(IntPtr handle);",
+        "  [DllImport(\"user32.dll\", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr handle, StringBuilder value, int maximum);",
+        "  public static YtVlcWindowInfo[] Find(int expectedProcessId) {",
+        "    var found = new List<YtVlcWindowInfo>();",
+        "    EnumWindows((handle, state) => {",
+        "      uint processId; GetWindowThreadProcessId(handle, out processId);",
+        "      if (processId != (uint)expectedProcessId || !IsWindowVisible(handle) || GetWindow(handle, 4) != IntPtr.Zero) return true;",
+        "      int length = GetWindowTextLength(handle); if (length <= 0) return true;",
+        "      var title = new StringBuilder(length + 1); GetWindowText(handle, title, title.Capacity);",
+        "      found.Add(new YtVlcWindowInfo { Handle = handle.ToInt64(), Title = title.ToString() });",
+        "      return true;",
+        "    }, IntPtr.Zero);",
+        "    return found.ToArray();",
+        "  }",
+        "}",
+        "'@",
+        `$p=Get-Process -Id ${pid}`,
+        `$windows=@([YtVlcWindowLookup]::Find(${pid}))`,
+        "[pscustomobject]@{Id=$p.Id;Path=$p.Path;Windows=$windows}|ConvertTo-Json -Depth 4 -Compress"
+    ].join("\n");
+}
+
 export function discordSnowflake(value: unknown, field: string): string {
     if (typeof value !== "string" || !/^\d{15,22}$/.test(value) || value === "0") {
         throw failure(400, "invalid_request", `${field} must be a Discord snowflake`);

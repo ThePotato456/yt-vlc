@@ -260,3 +260,31 @@ class SessionSchedulingTests(unittest.IsolatedAsyncioTestCase):
         if state.client_bridge_task is not None:
             await state.client_bridge_task
         discord_bot.GUILD_STATE.pop(state.guild_id, None)
+
+    async def test_ready_infers_guild_from_configured_voice_channel(self) -> None:
+        config = client_bridge.ClientBridgeConfig(
+            api_url=client_bridge.DEFAULT_API_URL,
+            token="secret-token",
+            voice_channel_id=234567890123456789,
+        )
+        bridge = client_bridge.ClientBridge(config)
+        bot = discord_bot.build_bot(None, None, bridge)
+        guild = SimpleNamespace(id=123456789012345678)
+        channel = SimpleNamespace(id=config.voice_channel_id, guild=guild)
+        state = discord_bot.GuildState(guild_id=guild.id)
+        discord_bot.GUILD_STATE[guild.id] = state
+
+        with (
+            patch.object(type(bot), "user", new_callable=unittest.mock.PropertyMock, return_value="bot"),
+            patch.object(type(bot), "guilds", new_callable=unittest.mock.PropertyMock, return_value=[guild, SimpleNamespace(id=999)]),
+            patch.object(bot, "get_channel", return_value=channel),
+            patch.object(bot, "get_guild", return_value=guild),
+            patch.object(discord_bot, "warm_up_vlc", new=AsyncMock()) as warmup,
+            patch.object(discord_bot, "schedule_client_session") as schedule,
+        ):
+            await bot.on_ready()
+
+        warmup.assert_awaited_once_with(state)
+        schedule.assert_called_once_with(state)
+        self.assertIs(state.client_bridge, bridge)
+        discord_bot.GUILD_STATE.pop(guild.id, None)

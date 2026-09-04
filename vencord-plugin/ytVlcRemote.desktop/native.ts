@@ -21,7 +21,8 @@ import {
     safeBearer,
     SerializedCommandQueue,
     validatedStreamPayload,
-    validateVoicePayload
+    validateVoicePayload,
+    windowsProcessQuery
 } from "./nativeCore";
 import type { BridgeCommand, CaptureSourceSummary, CommandKind, CommandResult, VerifiedCaptureSource } from "./types";
 
@@ -30,17 +31,10 @@ const BODY_LIMIT = 16 * 1024;
 const QUEUE_LIMIT = 16;
 const COMMAND_TIMEOUT_MS = 45_000;
 const POLL_TIMEOUT_MS = 25_000;
-const POWERSHELL_PROCESS_QUERY = [
-    "$ErrorActionPreference='Stop'",
-    "$p=Get-Process -Id ([int]$args[0])",
-    "[pscustomobject]@{Id=$p.Id;Path=$p.Path;MainWindowHandle=[string]$p.MainWindowHandle;MainWindowTitle=$p.MainWindowTitle}|ConvertTo-Json -Compress"
-].join(";");
-
 interface ProcessIdentity {
     Id: number;
     Path: string;
-    MainWindowHandle: string;
-    MainWindowTitle: string;
+    Windows: Array<{ Handle: number | string; Title: string; }>;
 }
 
 let server: Server | null = null;
@@ -106,7 +100,7 @@ async function verifyVlcSource(value: Record<string, unknown>): Promise<Verified
     try {
         const { stdout } = await execFileAsync(
             "powershell.exe",
-            ["-NoProfile", "-NonInteractive", "-Command", POWERSHELL_PROCESS_QUERY, String(pid)],
+            ["-NoProfile", "-NonInteractive", "-Command", windowsProcessQuery(pid)],
             { windowsHide: true, timeout: 5_000, maxBuffer: 32 * 1024 }
         );
         identity = JSON.parse(stdout) as ProcessIdentity;
@@ -129,13 +123,16 @@ async function verifyVlcSource(value: Record<string, unknown>): Promise<Verified
     if (actualCanonical !== expectedCanonical) {
         throw failure(409, "vlc_identity_mismatch", "The VLC PID does not match executable_path");
     }
-    let handle: bigint;
-    try {
-        handle = BigInt(identity.MainWindowHandle);
-    } catch {
-        handle = 0n;
-    }
-    if (handle <= 0n) {
+    const windows = Array.isArray(identity.Windows) ? identity.Windows : [];
+    const windowHandles = windows.flatMap(window => {
+        try {
+            const handle = BigInt(window.Handle);
+            return handle > 0n && window.Title ? [handle] : [];
+        } catch {
+            return [];
+        }
+    });
+    if (!windowHandles.length) {
         throw failure(409, "vlc_window_unavailable", "VLC does not have a capturable main window", true);
     }
     const sources = await desktopCapturer.getSources({
@@ -143,10 +140,18 @@ async function verifyVlcSource(value: Record<string, unknown>): Promise<Verified
         thumbnailSize: { width: 0, height: 0 },
         fetchWindowIcons: false
     });
-    const source = sources.find(candidate => captureSourceHandle(candidate.id) === handle);
-    if (!source) {
+    const matches = sources.filter(candidate => {
+        const handle = captureSourceHandle(candidate.id);
+        return handle !== null && windowHandles.includes(handle);
+    });
+    if (!matches.length) {
         throw failure(404, "vlc_capture_source_unavailable", "Discord cannot capture the verified VLC window", true);
     }
+    if (matches.length !== 1) {
+        throw failure(409, "vlc_capture_source_ambiguous", "Multiple capturable VLC windows match this PID");
+    }
+    const source = matches[0];
+    const handle = captureSourceHandle(source.id)!;
     return {
         id: source.id,
         name: source.name,

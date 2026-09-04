@@ -14,7 +14,8 @@ import {
     safeBearer,
     SerializedCommandQueue,
     validatedStreamPayload,
-    validateVoicePayload
+    validateVoicePayload,
+    windowsProcessQuery
 } from "./nativeCore";
 import type { CommandResult } from "./types";
 
@@ -59,6 +60,13 @@ describe("native REST boundary", () => {
         assert.deepEqual(validatedStreamPayload({ stream }), stream);
         assert.throws(() => validatedStreamPayload({ stream: { ...stream, audio: false } }));
         assert.throws(() => validatedStreamPayload({ stream: { ...stream, resolution: 1080 } }));
+    });
+
+    it("builds a non-interpolatable Windows process query", () => {
+        const query = windowsProcessQuery(24252);
+        assert.match(query, /Get-Process -Id 24252/);
+        assert.doesNotMatch(query, /\$args/);
+        assert.throws(() => windowsProcessQuery("24252"));
     });
 
     it("serializes mocked renderer actions", async () => {
