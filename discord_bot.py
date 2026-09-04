@@ -757,6 +757,7 @@ class GuildState:
     client_bridge_task: asyncio.Task[None] | None = field(default=None, repr=False)
     client_bridge_target_pid: int | None = None
     client_bridge_confirmed_pid: int | None = None
+    client_bridge_session_enabled: bool = True
 
 
 class CookieRetryView(discord.ui.View):
@@ -1385,7 +1386,7 @@ async def run_client_session_after(
 
 def schedule_client_session(state: GuildState) -> None:
     """Start one nonblocking setup loop for the current VLC process."""
-    if state.client_bridge is None:
+    if state.client_bridge is None or not state.client_bridge_session_enabled:
         return
     current = active_vlc_process(state)
     if current is None:
@@ -1410,6 +1411,53 @@ def schedule_client_session(state: GuildState) -> None:
         coroutine,
         name=f"yt-vlc-client-session-{state.guild_id}-{pid}",
     )
+
+
+async def cancel_client_session_task(state: GuildState) -> None:
+    """Cancel and drain any pending automatic bridge setup request."""
+    task = state.client_bridge_task
+    state.client_bridge_task = None
+    state.client_bridge_target_pid = None
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def force_client_session(state: GuildState) -> int:
+    """Immediately reapply the desired voice and VLC stream session once."""
+    if state.client_bridge is None:
+        raise RuntimeError("Discord client bridge is not configured")
+    current = active_vlc_process(state)
+    if current is None:
+        raise RuntimeError("VLC is not running")
+    pid, executable = current
+    await cancel_client_session_task(state)
+    state.client_bridge_session_enabled = True
+    state.client_bridge_target_pid = pid
+    await asyncio.to_thread(
+        state.client_bridge.ensure_session,
+        guild_id=state.guild_id,
+        vlc_pid=pid,
+        vlc_executable=executable,
+    )
+    if active_vlc_process(state) != (pid, executable):
+        raise RuntimeError("VLC changed while connecting the Discord client")
+    state.client_bridge_confirmed_pid = pid
+    return pid
+
+
+async def disconnect_client_session(state: GuildState) -> None:
+    """Stop sharing and leave voice without scheduling an automatic reconnect."""
+    if state.client_bridge is None:
+        raise RuntimeError("Discord client bridge is not configured")
+    state.client_bridge_session_enabled = False
+    await cancel_client_session_task(state)
+    state.client_bridge_confirmed_pid = None
+    await asyncio.to_thread(state.client_bridge.disconnect_session)
 
 
 def pending_requests(state: GuildState) -> tuple[MediaRequest, ...]:
@@ -2156,6 +2204,90 @@ def build_bot(
                     "will retry initialization",
                     warmup_guild_id,
                 )
+
+    @bot.command(name="connect", aliases=["join", "reconnect"])
+    async def connect_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Explicitly join the configured voice channel and share VLC."""
+        if not await bot.is_owner(ctx.author) or not await allowed_context(ctx):
+            return
+        if client_api is None:
+            await ctx.reply(
+                "The Discord client bridge is not configured.",
+                mention_author=False,
+            )
+            return
+        state = get_guild_state(target_guild_id(ctx))
+        state.client_bridge = client_api
+        try:
+            if active_vlc_process(state) is None:
+                async with vlc_warmup_lock:
+                    if active_vlc_process(state) is None:
+                        await warm_up_vlc(state)
+            pid = await force_client_session(state)
+        except client_bridge.ClientBridgeError as error:
+            LOGGER.warning(
+                "Explicit Discord client connect failed guild=%s code=%s",
+                state.guild_id,
+                error.code,
+            )
+            await ctx.reply(
+                f"Could not connect the Discord client: {str(error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+            return
+        except (OSError, RuntimeError, ValueError) as error:
+            LOGGER.exception("Explicit Discord client connect failed guild=%s", state.guild_id)
+            await ctx.reply(
+                f"Could not connect the Discord client: {str(error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+            return
+        LOGGER.info(
+            "Explicit Discord client connect confirmed guild=%s pid=%s requester=%s",
+            state.guild_id,
+            pid,
+            getattr(ctx.author, "id", "unknown"),
+        )
+        await ctx.reply(
+            "Discord client connected and sharing VLC at 720p/30 FPS.",
+            mention_author=False,
+        )
+
+    @bot.command(name="disconnect", aliases=["leave"])
+    async def disconnect_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Explicitly stop sharing and leave the client voice call."""
+        if not await bot.is_owner(ctx.author) or not await allowed_context(ctx):
+            return
+        if client_api is None:
+            await ctx.reply(
+                "The Discord client bridge is not configured.",
+                mention_author=False,
+            )
+            return
+        state = get_guild_state(target_guild_id(ctx))
+        state.client_bridge = client_api
+        try:
+            await disconnect_client_session(state)
+        except client_bridge.ClientBridgeError as error:
+            LOGGER.warning(
+                "Explicit Discord client disconnect failed guild=%s code=%s",
+                state.guild_id,
+                error.code,
+            )
+            await ctx.reply(
+                f"Could not disconnect the Discord client: {str(error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+            return
+        LOGGER.info(
+            "Explicit Discord client disconnect confirmed guild=%s requester=%s",
+            state.guild_id,
+            getattr(ctx.author, "id", "unknown"),
+        )
+        await ctx.reply(
+            "Discord client stopped sharing and left voice; VLC remains open.",
+            mention_author=False,
+        )
 
     @bot.command(name="play", aliases=["request", "p"])
     async def play_command(ctx: commands.Context[commands.Bot], *, url: str) -> None:

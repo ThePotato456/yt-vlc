@@ -125,6 +125,11 @@ class ClientBridge:
         }
         return self._request("PUT", "/v1/session", payload)
 
+    def disconnect_session(self) -> dict[str, object]:
+        """Stop the client stream and leave voice without touching VLC."""
+        self._request("DELETE", "/v1/stream")
+        return self._request("DELETE", "/v1/voice")
+
     def _request(
         self,
         method: str,

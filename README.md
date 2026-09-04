@@ -240,7 +240,9 @@ at 720p/30 FPS. Failures retry in the background after 1, 2, 5, 10, and then
 30-second intervals, so bot commands remain usable. A replacement VLC PID
 triggers a fresh request. After successful setup, a manual disconnect is not
 continuously reversed, and stopping the bot does not leave voice or stop the
-stream.
+stream. The bot owner can use `!connect` to explicitly rejoin after an AFK move
+or disconnect and `!disconnect` to stop sharing and leave voice. These commands
+leave VLC and media playback running.
 
 ### Audio routing
 
@@ -273,6 +275,8 @@ Never commit `.env`. It is excluded by `.gitignore`.
 
 | Command | Behavior |
 |---|---|
+| `!connect`, `!join`, `!reconnect` | Owner-only: join the configured voice channel and share the bot-owned VLC window |
+| `!disconnect`, `!leave` | Owner-only: stop sharing and leave voice without closing VLC |
 | `!play <URL> [URL ...]`, `!p <URL> [URL ...]` | Queue one or more URLs in the provided order |
 | `!local`, `!localqueue`, `!media` | Browse and queue files beneath `./media` |
 | `!pause` | Pause the active VLC item |

@@ -767,6 +767,79 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
             await command.callback(other_context)  # type: ignore[arg-type, union-attr]
         self.assertEqual(other_context.replies, [])
 
+    async def test_connect_command_reapplies_the_client_session(self) -> None:
+        bridge = MagicMock()
+        bridge.ensure_session.return_value = {"ok": True}
+        bot = discord_bot.build_bot(
+            request_channel_id=None,
+            configured_guild_id=123,
+            client_api=bridge,
+        )
+        state = discord_bot.GuildState(guild_id=123)
+        state.vlc = SimpleNamespace(
+            executable=str(Path("vlc.exe").resolve()),
+            process=SimpleNamespace(pid=4321, poll=lambda: None),
+        )
+        discord_bot.GUILD_STATE[123] = state
+        context = FakeContext()
+        try:
+            command = bot.get_command("connect")
+            self.assertIsNotNone(command)
+            with patch.object(bot, "is_owner", new=AsyncMock(return_value=True)):
+                await command.callback(context)  # type: ignore[arg-type, union-attr]
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        bridge.ensure_session.assert_called_once()
+        self.assertIn("connected and sharing VLC", context.replies[-1])
+
+    async def test_disconnect_command_leaves_vlc_running(self) -> None:
+        bridge = MagicMock()
+        bridge.disconnect_session.return_value = {"ok": True}
+        bot = discord_bot.build_bot(
+            request_channel_id=None,
+            configured_guild_id=123,
+            client_api=bridge,
+        )
+        process = SimpleNamespace(pid=4321, poll=lambda: None)
+        state = discord_bot.GuildState(guild_id=123)
+        state.vlc = SimpleNamespace(
+            executable=str(Path("vlc.exe").resolve()),
+            process=process,
+        )
+        state.client_bridge_confirmed_pid = 4321
+        discord_bot.GUILD_STATE[123] = state
+        context = FakeContext()
+        try:
+            command = bot.get_command("disconnect")
+            self.assertIsNotNone(command)
+            with patch.object(bot, "is_owner", new=AsyncMock(return_value=True)):
+                await command.callback(context)  # type: ignore[arg-type, union-attr]
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        bridge.disconnect_session.assert_called_once_with()
+        self.assertIsNone(state.client_bridge_confirmed_pid)
+        self.assertIsNone(process.poll())
+        self.assertIn("VLC remains open", context.replies[-1])
+
+    async def test_client_session_commands_are_owner_only_in_guilds(self) -> None:
+        bridge = MagicMock()
+        bot = discord_bot.build_bot(
+            request_channel_id=None,
+            configured_guild_id=123,
+            client_api=bridge,
+        )
+        context = FakeContext()
+
+        with patch.object(bot, "is_owner", new=AsyncMock(return_value=False)):
+            await bot.get_command("connect").callback(context)  # type: ignore[arg-type, union-attr]
+            await bot.get_command("disconnect").callback(context)  # type: ignore[arg-type, union-attr]
+
+        bridge.ensure_session.assert_not_called()
+        bridge.disconnect_session.assert_not_called()
+        self.assertEqual(context.replies, [])
+
     async def test_owner_dm_automatically_targets_the_only_guild(self) -> None:
         bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=None)
         command = bot.get_command("queue")

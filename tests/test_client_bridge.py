@@ -117,6 +117,22 @@ class ClientBridgeTests(unittest.TestCase):
         self.assertTrue(payload["self_deaf"])
         self.assertTrue(result["ok"])
 
+    def test_disconnect_stops_stream_before_leaving_voice(self) -> None:
+        bridge = configured_client()
+        requests = []
+
+        def open_request(request: object, timeout: float) -> FakeResponse:
+            requests.append(request)
+            return FakeResponse(200, {"ok": True, "data": {}})
+
+        with patch.object(client_bridge, "urlopen", side_effect=open_request):
+            result = bridge.disconnect_session()
+
+        self.assertEqual([request.get_method() for request in requests], ["DELETE", "DELETE"])
+        self.assertTrue(requests[0].full_url.endswith("/v1/stream"))
+        self.assertTrue(requests[1].full_url.endswith("/v1/voice"))
+        self.assertTrue(result["ok"])
+
     def test_http_error_is_structured_and_token_is_redacted(self) -> None:
         token = "never-show-this-token"
         bridge = configured_client(token)
@@ -168,11 +184,16 @@ class FakeBridge:
     def __init__(self, failures: int = 0) -> None:
         self.failures = failures
         self.calls: list[dict[str, object]] = []
+        self.disconnect_calls = 0
 
     def ensure_session(self, **kwargs: object) -> dict[str, object]:
         self.calls.append(kwargs)
         if len(self.calls) <= self.failures:
             raise client_bridge.ClientBridgeError("bridge_unavailable", "unavailable")
+        return {"ok": True}
+
+    def disconnect_session(self) -> dict[str, object]:
+        self.disconnect_calls += 1
         return {"ok": True}
 
 
@@ -227,6 +248,36 @@ class SessionSchedulingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([call["vlc_pid"] for call in bridge.calls], [100, 200])
         self.assertEqual(state.client_bridge_confirmed_pid, 200)
+
+    async def test_force_session_reconnects_an_already_confirmed_pid(self) -> None:
+        bridge = FakeBridge()
+        state = self.make_state(bridge)
+        state.client_bridge_confirmed_pid = 100
+        state.client_bridge_session_enabled = False
+
+        pid = await discord_bot.force_client_session(state)
+
+        self.assertEqual(pid, 100)
+        self.assertEqual(len(bridge.calls), 1)
+        self.assertEqual(state.client_bridge_confirmed_pid, 100)
+        self.assertTrue(state.client_bridge_session_enabled)
+
+    async def test_disconnect_clears_confirmation_without_stopping_vlc(self) -> None:
+        bridge = FakeBridge()
+        state = self.make_state(bridge)
+        state.client_bridge_confirmed_pid = 100
+
+        await discord_bot.disconnect_client_session(state)
+
+        self.assertEqual(bridge.disconnect_calls, 1)
+        self.assertIsNone(state.client_bridge_confirmed_pid)
+        self.assertFalse(state.client_bridge_session_enabled)
+        self.assertEqual(discord_bot.active_vlc_process(state)[0], 100)
+
+        state.vlc.process = FakeProcess(200)  # type: ignore[union-attr]
+        discord_bot.schedule_client_session(state)
+        await asyncio.sleep(0)
+        self.assertEqual(bridge.calls, [])
 
     async def test_ready_does_not_wait_for_bridge_request(self) -> None:
         entered = threading.Event()
