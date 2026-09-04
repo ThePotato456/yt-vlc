@@ -1,22 +1,27 @@
 # yt-vlc
 
+![yt-vlc direct network playback with yt-dlp and VLC](docs/social-preview.png)
+
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)
 ![yt-dlp 2026.07.04](https://img.shields.io/badge/yt--dlp-2026.07.04-FF0000?logo=youtube&logoColor=white)
 ![Deno 2.8.1](https://img.shields.io/badge/Deno-2.8.1-000000?logo=deno&logoColor=white)
 ![VLC 3.0.23](https://img.shields.io/badge/VLC-3.0.23-FF8800?logo=vlcmediaplayer&logoColor=white)
 
-A Windows media-playback bridge powered by yt-dlp and VLC, with a polished
-command-line interface and an optional Discord request bot.
+A Windows-first media player powered by yt-dlp and VLC, with a polished CLI,
+an optional Discord request bot, and authenticated Discord Canary automation.
 
 `yt-vlc` resolves a media page into direct network streams with `yt-dlp -g`
 and hands those streams to VLC. It supports combined media as well as separate
-video and audio streams without downloading the complete file first.
+video and audio streams without downloading the complete file first. With the
+optional Canary bridge enabled, the logged-in user account can automatically
+join a configured voice channel and share the exact bot-owned VLC window.
 
 | Mode | Best for |
 |---|---|
 | CLI | Opening a URL directly in VLC from PowerShell |
-| Discord bot | Running a requestable VLC player with optional automatic Canary sharing |
+| Discord bot | Running a requestable VLC player with queues, local media, and playback controls |
+| Canary bridge | Joining voice and sharing the bot-owned VLC window from the logged-in user account |
 
 ## Highlights
 
@@ -28,7 +33,40 @@ video and audio streams without downloading the complete file first.
 - Lazily resolves queued URLs so signed stream links do not expire while waiting
 - Supports ordered multi-link requests, local media, seeking, and playlist control
 - Routes Discord playback through a named Windows audio endpoint
+- Joins or moves the Canary user account into a configured guild voice channel
+- Shares only the verified VLC application window with audio at 720p/30 FPS
+- Provides owner-only `!connect` and `!disconnect` session controls
 - Redacts credential-bearing debrid URLs from Discord output and logs
+
+## Discord Canary bridge
+
+The bundled Windows-only `YtVlcRemote` Vencord userplugin exposes an
+authenticated REST service at `http://127.0.0.1:38423`. The bot uses it to
+control the logged-in Canary account; the Discord bot account itself does not
+join voice or stream.
+
+During automatic setup, the bridge:
+
+1. Verifies the requested PID belongs to the bot's expected `vlc.exe`.
+2. Matches that process to one exact Discord window-capture source.
+3. Joins or moves to the configured ordinary guild voice channel.
+4. Self-mutes and self-deafens the logged-in account.
+5. Waits 1.5 seconds for Discord's voice state to settle.
+6. Starts application-only sharing with audio at 720p/30 FPS.
+
+The bridge binds only to IPv4 loopback, requires a generated bearer token, and
+never falls back to sharing a display. Mutations are serialized and confirmed
+against Discord state. Transient startup failures retry in the background;
+permanent failures stop until corrected and explicitly retried.
+
+The bot owner can use `!connect` (aliases `!join` and `!reconnect`) after an AFK
+move or disconnect. `!disconnect` (alias `!leave`) stops sharing and leaves
+voice without closing VLC. An explicit disconnect remains in effect until
+`!connect` or the next bot restart.
+
+See the [YtVlcRemote plugin reference](vencord-plugin/ytVlcRemote.desktop/README.md)
+for REST endpoints, payloads, and direct API examples. Full installation steps
+are included in [Bot setup](#bot-setup).
 
 ## Screenshots
 
@@ -371,6 +409,9 @@ are exposed.
 4. CLI launches reuse VLC and replace the active item.
 5. The Discord bot keeps a dedicated VLC process alive and controls its
    playlist through a password-protected local HTTP interface.
+6. When configured, the authenticated Canary bridge verifies that VLC process,
+   joins voice, and shares its exact application window through Discord's
+   internal renderer actions.
 
 ## Troubleshooting
 
@@ -442,7 +483,8 @@ python -m unittest discover -s tests -v
 The suite covers queue behavior, VLC control, audio routing, seeking, local
 media, cookie retries, sensitive-link redaction, playback recovery, bridge
 configuration and authentication, retry scheduling, duplicate-ready
-suppression, and VLC PID replacement.
+suppression, explicit connection controls, mutation serialization, timeout
+handling, source redaction, and VLC PID replacement.
 
 ## Contributing
 
