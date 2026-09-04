@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { findByCodeLazy, findByPropsLazy } from "@webpack";
+import { findByCodeLazy, findByPropsLazy, findStoreLazy } from "@webpack";
 import {
     ApplicationStreamingStore,
     ChannelStore,
@@ -24,12 +24,21 @@ const VoiceActions = findByPropsLazy("toggleSelfMute") as {
     toggleSelfMute(): void;
     toggleSelfDeaf(): void;
 };
-const startStream = findByCodeLazy('type:"STREAM_START"') as (
-    guildId: string,
-    channelId: string,
+const startStreamWithSource = findByCodeLazy("no user or channel", "Starting stream for source id") as (
+    source: { id: string; name: string; },
     options: Record<string, unknown>
-) => Promise<void> | void;
+) => Promise<[boolean, string | undefined]>;
 const stopStream = findByCodeLazy('type:"STREAM_STOP"') as (streamKey: string) => Promise<void> | void;
+const ApplicationStreamingSettingsStore = findStoreLazy("ApplicationStreamingSettingsStore") as {
+    getState(): {
+        resolution?: number;
+        fps?: number;
+        soundshareEnabled?: boolean;
+    };
+};
+const StreamPresets = findByPropsLazy("PRESET_VIDEO", "PRESET_CUSTOM", "PRESET_AUTO") as {
+    PRESET_CUSTOM: number;
+};
 
 const CONFIRM_TIMEOUT_MS = 12_000;
 const CONFIRM_INTERVAL_MS = 100;
@@ -60,7 +69,16 @@ async function waitFor(predicate: () => boolean, code: string, message: string):
 }
 
 function currentStream(): any | null {
-    return ApplicationStreamingStore.getCurrentUserActiveStream?.() ?? null;
+    const selectedChannelId = SelectedChannelStore.getVoiceChannelId?.();
+    if (!selectedChannelId) return null;
+    let stream = ApplicationStreamingStore.getCurrentUserActiveStream?.() ?? null;
+    if (!stream) {
+        const currentUserId = UserStore.getCurrentUser?.()?.id;
+        stream = currentUserId
+            ? ApplicationStreamingStore.getAnyStreamForUser?.(currentUserId) ?? null
+            : null;
+    }
+    return stream?.channelId === selectedChannelId ? stream : null;
 }
 
 function streamKey(stream: any): string {
@@ -74,6 +92,7 @@ function currentStatus(): Record<string, unknown> {
     const stream = currentStream();
     const metadata = ApplicationStreamingStore.getStreamerActiveStreamMetadata?.();
     const source = MediaEngineStore.getGoLiveSource?.();
+    const settings = ApplicationStreamingSettingsStore.getState?.() ?? {};
     return {
         voice: {
             channel_id: SelectedChannelStore.getVoiceChannelId?.() ?? null,
@@ -87,8 +106,8 @@ function currentStatus(): Record<string, unknown> {
             source_id: source?.desktopSource?.id ?? null,
             source_pid: metadata?.pid ?? source?.desktopSource?.sourcePid ?? null,
             source_name: metadata?.sourceName ?? null,
-            resolution: source?.quality?.resolution ?? null,
-            fps: source?.quality?.frameRate ?? null
+            resolution: source?.quality?.resolution ?? settings.resolution ?? null,
+            fps: source?.quality?.frameRate ?? settings.fps ?? null
         } : { active: false }
     };
 }
@@ -173,37 +192,45 @@ async function startSharing(source?: VerifiedCaptureSource): Promise<void> {
         throw new AdapterError(403, "missing_permission", "The account lacks Stream permission");
     }
     if (currentStream()) await stopSharing();
-    await Promise.resolve(startStream(channel.guild_id, selectedChannelId, {
-        pid: source.pid,
-        sourceId: source.id,
-        sourceName: source.name,
-        audioSourceId: source.name,
-        sound: true,
-        previewDisabled: true,
-        quality: { resolution: 720, frameRate: 30 }
-    }));
+    const [started] = await startStreamWithSource({ id: source.id, name: source.name }, {
+        preset: StreamPresets.PRESET_CUSTOM,
+        resolution: 720,
+        fps: 30,
+        soundshareEnabled: true,
+        previewDisabled: true
+    });
+    if (!started) {
+        throw new AdapterError(
+            503,
+            "discord_api_unavailable",
+            "Discord could not start the verified VLC window stream",
+            true
+        );
+    }
     await waitFor(() => {
         const stream = currentStream();
-        const liveSource = MediaEngineStore.getGoLiveSource?.();
+        const metadata = ApplicationStreamingStore.getStreamerActiveStreamMetadata?.();
+        const desktopSource = MediaEngineStore.getGoLiveSource?.()?.desktopSource;
+        const livePid = metadata?.pid ?? desktopSource?.sourcePid;
         return Boolean(
             stream
             && stream.channelId === selectedChannelId
-            && liveSource?.desktopSource?.id === source.id
+            && desktopSource?.id === source.id
+            && Number(livePid) === source.pid
         );
     }, "stream_start_timeout", "Discord did not confirm the VLC stream");
 
     try {
         await waitFor(() => {
-            const desktopSource = MediaEngineStore.getGoLiveSource?.()?.desktopSource;
-            return Boolean(desktopSource?.soundshareId || desktopSource?.soundshareSession);
+            return ApplicationStreamingSettingsStore.getState?.().soundshareEnabled === true;
         }, "stream_audio_timeout", "Discord did not confirm application audio sharing");
     } catch (error) {
         await stopSharing();
         throw error;
     }
 
-    const quality = MediaEngineStore.getGoLiveSource?.()?.quality;
-    if (quality && (quality.resolution !== 720 || quality.frameRate !== 30)) {
+    const quality = ApplicationStreamingSettingsStore.getState?.();
+    if (quality?.resolution !== 720 || quality?.fps !== 30 || quality?.soundshareEnabled !== true) {
         await stopSharing();
         throw new AdapterError(
             409,
@@ -275,10 +302,12 @@ export function adapterAvailable(): boolean {
             ChannelActions?.selectVoiceChannel,
             VoiceActions?.toggleSelfMute,
             VoiceActions?.toggleSelfDeaf,
-            startStream,
+            startStreamWithSource,
             stopStream,
             ApplicationStreamingStore?.getCurrentUserActiveStream,
+            ApplicationStreamingStore?.getAnyStreamForUser,
             MediaEngineStore?.getGoLiveSource,
+            ApplicationStreamingSettingsStore?.getState,
             UserStore?.getCurrentUser
         ];
         return functions.every(value => typeof value === "function");
