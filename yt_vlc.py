@@ -29,9 +29,15 @@ YT_DLP_URL = (
     "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp.exe"
 )
 VLC_URL = "https://get.videolan.org/vlc/3.0.23/win64/vlc-3.0.23-win64.zip"
-VLC_AUDIO_DEVICE = (
-    "{0.0.0.00000000}.{C57B4F31-DD70-4FF3-A187-2F48284FD193}"
+DEFAULT_VLC_AUDIO_DEVICE = "CABLE Input"
+MMDEVICE_RENDER_REGISTRY_KEY = (
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
 )
+MMDEVICE_NAME_VALUES = (
+    "{a45c254e-df1c-4efd-8020-67d146a850e0},14",  # Friendly name
+    "{a45c254e-df1c-4efd-8020-67d146a850e0},2",  # Device description
+)
+MMDEVICE_ACTIVE_STATE = 0x1
 
 DENO_VERSION = "2.8.1"
 DENO_URL = (
@@ -549,8 +555,139 @@ def resolve_streams(
     return streams, metadata
 
 
-def vlc_command(vlc: str, streams: list[str]) -> list[str]:
-    """Build the VLC command and route playback through VB-CABLE."""
+def windows_render_endpoints() -> list[tuple[str, str]]:
+    """Return active Windows MMDevice render endpoint IDs and friendly names."""
+    if os.name != "nt":
+        raise RuntimeError("Selecting a VLC MMDevice audio endpoint requires Windows")
+
+    import winreg
+
+    endpoints: list[tuple[str, str]] = []
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            MMDEVICE_RENDER_REGISTRY_KEY,
+        ) as render_key:
+            index = 0
+            while True:
+                try:
+                    endpoint_key_name = winreg.EnumKey(render_key, index)
+                except OSError:
+                    break
+                index += 1
+
+                try:
+                    with winreg.OpenKey(render_key, endpoint_key_name) as endpoint_key:
+                        state, _ = winreg.QueryValueEx(endpoint_key, "DeviceState")
+                    if not int(state) & MMDEVICE_ACTIVE_STATE:
+                        continue
+                    with winreg.OpenKey(
+                        render_key,
+                        endpoint_key_name + r"\Properties",
+                    ) as properties_key:
+                        name = None
+                        for value_name in MMDEVICE_NAME_VALUES:
+                            try:
+                                candidate, _ = winreg.QueryValueEx(
+                                    properties_key,
+                                    value_name,
+                                )
+                            except OSError:
+                                continue
+                            if isinstance(candidate, str) and candidate.strip():
+                                name = candidate.strip()
+                                break
+                        if name is None:
+                            continue
+                except (OSError, TypeError, ValueError):
+                    continue
+
+                endpoint_id = f"{{0.0.0.00000000}}.{endpoint_key_name.upper()}"
+                endpoints.append((endpoint_id, str(name)))
+    except OSError as error:
+        raise RuntimeError(
+            f"Could not enumerate Windows audio output devices: {error}"
+        ) from error
+
+    return endpoints
+
+
+def resolve_mmdevice_audio_device(
+    selector: str | None = None,
+    *,
+    endpoints: list[tuple[str, str]] | None = None,
+) -> str:
+    """Resolve a friendly output name or endpoint ID without silent fallback."""
+    requested = (
+        selector
+        if selector is not None
+        else os.environ.get("VLC_AUDIO_DEVICE", DEFAULT_VLC_AUDIO_DEVICE)
+    ).strip()
+    if not requested:
+        raise RuntimeError("VLC_AUDIO_DEVICE cannot be empty when using mmdevice")
+
+    available = windows_render_endpoints() if endpoints is None else endpoints
+    requested_folded = requested.casefold()
+
+    for endpoint_id, _ in available:
+        if endpoint_id.casefold() == requested_folded:
+            return endpoint_id
+
+    exact_names = [
+        endpoint_id
+        for endpoint_id, name in available
+        if name.casefold() == requested_folded
+    ]
+    if len(exact_names) == 1:
+        return exact_names[0]
+
+    partial_names = [
+        endpoint_id
+        for endpoint_id, name in available
+        if requested_folded in name.casefold()
+    ]
+    if len(partial_names) == 1:
+        return partial_names[0]
+    if len(partial_names) > 1:
+        raise RuntimeError(
+            f"VLC_AUDIO_DEVICE={requested!r} matches multiple active audio outputs; "
+            "use the complete device name or endpoint ID"
+        )
+
+    names = ", ".join(name for _, name in available) or "none"
+    raise RuntimeError(
+        f"VLC audio output {requested!r} is not active. Active outputs: {names}. "
+        "Install/enable VB-CABLE or set VLC_AUDIO_DEVICE to an active output."
+    )
+
+
+def vlc_audio_options(
+    audio_output: str | None,
+    audio_device: str | None = None,
+) -> tuple[list[str], str | None]:
+    """Build VLC audio arguments and return the resolved endpoint when applicable."""
+    if audio_output is None:
+        return [], None
+
+    options = [f"--aout={audio_output}"]
+    if audio_output != "mmdevice":
+        return options, None
+
+    resolved_device = resolve_mmdevice_audio_device(audio_device)
+    options.append(f"--mmdevice-audio-device={resolved_device}")
+    return options, resolved_device
+
+
+def vlc_command(
+    vlc: str,
+    streams: list[str],
+    *,
+    audio_output: str | None = "mmdevice",
+    audio_device: str | None = None,
+) -> list[str]:
+    """Build the VLC command, pinning MMDevice playback to the requested output."""
+
+    audio_options, _ = vlc_audio_options(audio_output, audio_device)
 
     command = [
         vlc,
@@ -560,16 +697,8 @@ def vlc_command(vlc: str, streams: list[str]) -> list[str]:
 
         # Replace the current item instead of appending to VLC's playlist.
         "--no-playlist-enqueue",
-
-        # Force VLC to use the Windows MMDevice/Core Audio output backend.
-        "--aout=mmdevice",
-
-        # Route VLC audio specifically to:
-        # CABLE Input (VB-Audio Virtual Cable)
-        f"--mmdevice-audio-device={VLC_AUDIO_DEVICE}",
-
-        # Primary video or combined video/audio stream.
-        streams[0],
+        *audio_options,
+        streams[0],  # Primary video or combined video/audio stream.
     ]
 
     # yt-dlp can return separate video and audio URLs.

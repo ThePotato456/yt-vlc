@@ -1040,6 +1040,60 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
         command = popen.call_args.args[0]
         self.assertIn("--aout=directsound", command)
 
+    def test_vlc_launch_resolves_and_pins_mmdevice_output(self) -> None:
+        process = MagicMock()
+        process.pid = 1234
+        endpoint_id = "{0.0.0.00000000}.{CABLE-ENDPOINT}"
+        with (
+            patch.dict(
+                discord_bot.os.environ,
+                {
+                    "VLC_AUDIO_OUTPUT": "mmdevice",
+                    "VLC_AUDIO_DEVICE": "CABLE Input",
+                },
+            ),
+            patch.object(
+                yt_vlc,
+                "windows_render_endpoints",
+                return_value=[(endpoint_id, "CABLE Input")],
+            ),
+            patch.object(
+                discord_bot.VLCSession,
+                "_available_port",
+                return_value=4567,
+            ),
+            patch.object(
+                discord_bot.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+        ):
+            session = discord_bot.VLCSession("vlc.exe")
+            session._launch()
+
+        command = popen.call_args.args[0]
+        self.assertIn("--aout=mmdevice", command)
+        self.assertIn(f"--mmdevice-audio-device={endpoint_id}", command)
+
+    def test_mmdevice_output_never_silently_falls_back(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "is not active"):
+            yt_vlc.resolve_mmdevice_audio_device(
+                "CABLE Input",
+                endpoints=[
+                    ("{0.0.0.00000000}.{SPEAKERS}", "Speakers"),
+                ],
+            )
+
+    def test_mmdevice_friendly_name_resolves_case_insensitively(self) -> None:
+        endpoint_id = "{0.0.0.00000000}.{CABLE-ENDPOINT}"
+        self.assertEqual(
+            yt_vlc.resolve_mmdevice_audio_device(
+                "cable input",
+                endpoints=[(endpoint_id, "CABLE Input")],
+            ),
+            endpoint_id,
+        )
+
     def test_automatic_vlc_audio_output_omits_module_override(self) -> None:
         with patch.dict(
             discord_bot.os.environ,

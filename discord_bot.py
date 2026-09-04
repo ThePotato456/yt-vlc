@@ -459,6 +459,7 @@ class VLCSession:
         self.port = self._available_port()
         self.password = secrets.token_urlsafe(24)
         audio_output = configured_vlc_audio_output()
+        audio_options, audio_device = yt_vlc.vlc_audio_options(audio_output)
 
         command = [
             self.executable,
@@ -470,17 +471,8 @@ class VLCSession:
             "--recursive=expand",
             "--no-qt-privacy-ask",
             "--no-video-title-show",
+            *audio_options,
         ]
-
-        if audio_output is not None:
-            command.append(f"--aout={audio_output}")
-
-        # When using Windows MMDevice, explicitly select
-        # CABLE Input (VB-Audio Virtual Cable).
-        if audio_output == "mmdevice":
-            command.append(
-                f"--mmdevice-audio-device={yt_vlc.VLC_AUDIO_DEVICE}"
-            )
 
         self.process = subprocess.Popen(
             command,
@@ -495,7 +487,7 @@ class VLCSession:
             self.process.pid,
             self.port,
             audio_output or "automatic",
-            yt_vlc.VLC_AUDIO_DEVICE if audio_output == "mmdevice" else "default",
+            audio_device or "default",
         )
 
     def _ensure_started(self) -> None:
