@@ -236,8 +236,10 @@ sharing.
 At startup, the bot prepares its tools and opens an idle VLC window. When the
 client bridge is configured, it asks Canary once to join the configured voice
 channel, self-mute/deafen, and share that exact bot-owned VLC window with audio
-at 720p/30 FPS. Failures retry in the background after 1, 2, 5, 10, and then
-30-second intervals, so bot commands remain usable. A replacement VLC PID
+at 720p/30 FPS. The combined session waits 1.5 seconds after voice connection
+confirmation before starting the stream so Discord's media state can settle.
+Failures retry in the background after 1, 2, 5, 10, and then 30-second
+intervals, so bot commands remain usable. A replacement VLC PID
 triggers a fresh request. After successful setup, a manual disconnect is not
 continuously reversed, and stopping the bot does not leave voice or stop the
 stream. The bot owner can use `!connect` to explicitly rejoin after an AFK move

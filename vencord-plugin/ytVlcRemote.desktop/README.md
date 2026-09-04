@@ -35,7 +35,7 @@ unauthenticated; all other endpoints require `Authorization: Bearer <token>`.
 | `GET` | `/v1/capture-sources` | Window-only capture source metadata |
 | `PUT`, `DELETE` | `/v1/voice` | Join/move/configure or leave guild voice |
 | `PUT`, `DELETE` | `/v1/stream` | Start/replace or stop exact VLC sharing |
-| `PUT` | `/v1/session` | Join/move, mute/deafen, and share VLC atomically |
+| `PUT` | `/v1/session` | Join/move, mute/deafen, wait 1.5 seconds for voice state to settle, and share VLC atomically |
 
 Mutations are serialized and wait for Discord store confirmation. The queue is
 bounded, request bodies are limited to 16 KiB, browser Origin requests and

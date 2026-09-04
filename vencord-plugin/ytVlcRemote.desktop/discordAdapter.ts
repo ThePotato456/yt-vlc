@@ -42,6 +42,7 @@ const StreamPresets = findByPropsLazy("PRESET_VIDEO", "PRESET_CUSTOM", "PRESET_A
 
 const CONFIRM_TIMEOUT_MS = 12_000;
 const CONFIRM_INTERVAL_MS = 100;
+const SESSION_STREAM_SETTLE_MS = 1_500;
 
 class AdapterError extends Error {
     constructor(
@@ -265,6 +266,7 @@ export async function executeCommand(command: BridgeCommand): Promise<CommandRes
             case "session.put": {
                 const { guildId, channelId } = validateChannel(command.payload);
                 await joinVoice(command.payload);
+                await new Promise(resolve => setTimeout(resolve, SESSION_STREAM_SETTLE_MS));
                 if (SelectedChannelStore.getVoiceChannelId?.() !== channelId) {
                     throw new AdapterError(409, "voice_state_changed", "The voice channel changed during setup", true);
                 }
