@@ -1329,6 +1329,16 @@ async def run_client_session_setup(state: GuildState, pid: int, executable: str)
         except asyncio.CancelledError:
             raise
         except client_bridge.ClientBridgeError as error:
+            if not error.retryable:
+                state.client_bridge_session_enabled = False
+                LOGGER.error(
+                    "Discord client session setup rejected guild=%s pid=%s code=%s; "
+                    "use !connect after correcting the configuration or permissions",
+                    state.guild_id,
+                    pid,
+                    error.code,
+                )
+                return
             delay = CLIENT_BRIDGE_RETRY_DELAYS[
                 min(retry_index, len(CLIENT_BRIDGE_RETRY_DELAYS) - 1)
             ]
@@ -1436,14 +1446,20 @@ async def force_client_session(state: GuildState) -> int:
         raise RuntimeError("VLC is not running")
     pid, executable = current
     await cancel_client_session_task(state)
+    was_enabled = state.client_bridge_session_enabled
     state.client_bridge_session_enabled = True
     state.client_bridge_target_pid = pid
-    await asyncio.to_thread(
-        state.client_bridge.ensure_session,
-        guild_id=state.guild_id,
-        vlc_pid=pid,
-        vlc_executable=executable,
-    )
+    try:
+        await asyncio.to_thread(
+            state.client_bridge.ensure_session,
+            guild_id=state.guild_id,
+            vlc_pid=pid,
+            vlc_executable=executable,
+        )
+    except (Exception, asyncio.CancelledError):
+        state.client_bridge_session_enabled = was_enabled
+        state.client_bridge_target_pid = None
+        raise
     if active_vlc_process(state) != (pid, executable):
         raise RuntimeError("VLC changed while connecting the Discord client")
     state.client_bridge_confirmed_pid = pid

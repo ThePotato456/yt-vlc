@@ -56,7 +56,7 @@ class ClientBridgeTests(unittest.TestCase):
     def test_configuration_requires_token_and_channel_together(self) -> None:
         with patch.dict(
             os.environ,
-            {"DISCORD_CLIENT_API_TOKEN": "secret"},
+            {"DISCORD_CLIENT_API_TOKEN": "s" * 32},
             clear=True,
         ):
             with self.assertRaisesRegex(RuntimeError, "must both be set"):
@@ -67,7 +67,7 @@ class ClientBridgeTests(unittest.TestCase):
             os.environ,
             {
                 "DISCORD_CLIENT_API_URL": "https://example.com:38423",
-                "DISCORD_CLIENT_API_TOKEN": "secret",
+                "DISCORD_CLIENT_API_TOKEN": "s" * 32,
                 "DISCORD_VOICE_CHANNEL_ID": "234567890123456789",
             },
             clear=True,
@@ -80,12 +80,24 @@ class ClientBridgeTests(unittest.TestCase):
             os.environ,
             {
                 "DISCORD_CLIENT_API_URL": "http://127.0.0.2:38423",
-                "DISCORD_CLIENT_API_TOKEN": "secret",
+                "DISCORD_CLIENT_API_TOKEN": "s" * 32,
                 "DISCORD_VOICE_CHANNEL_ID": "234567890123456789",
             },
             clear=True,
         ):
             with self.assertRaisesRegex(RuntimeError, "127.0.0.1"):
+                client_bridge.load_client_bridge_config()
+
+    def test_configuration_rejects_invalid_token_length(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "DISCORD_CLIENT_API_TOKEN": "too-short",
+                "DISCORD_VOICE_CHANNEL_ID": "234567890123456789",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "32 to 256"):
                 client_bridge.load_client_bridge_config()
 
     def test_session_request_authenticates_and_sends_exact_vlc_identity(self) -> None:
@@ -128,9 +140,40 @@ class ClientBridgeTests(unittest.TestCase):
         with patch.object(client_bridge, "urlopen", side_effect=open_request):
             result = bridge.disconnect_session()
 
-        self.assertEqual([request.get_method() for request in requests], ["DELETE", "DELETE"])
+        self.assertEqual(
+            [request.get_method() for request in requests],
+            ["DELETE", "DELETE"],
+        )
         self.assertTrue(requests[0].full_url.endswith("/v1/stream"))
         self.assertTrue(requests[1].full_url.endswith("/v1/voice"))
+        self.assertTrue(result["ok"])
+
+    def test_disconnect_still_leaves_voice_when_stream_cleanup_fails(self) -> None:
+        bridge = configured_client()
+        body = json.dumps(
+            {
+                "ok": False,
+                "error": {
+                    "code": "stream_stop_timeout",
+                    "message": "Discord did not confirm stopping the stream",
+                    "retryable": True,
+                },
+            }
+        ).encode()
+        stream_failure = HTTPError("url", 504, "Timeout", {}, io.BytesIO(body))
+        voice_success = FakeResponse(200, {"ok": True, "data": {}})
+
+        with patch.object(
+            client_bridge,
+            "urlopen",
+            side_effect=[stream_failure, voice_success],
+        ) as open_request:
+            result = bridge.disconnect_session()
+
+        self.assertEqual(open_request.call_count, 2)
+        leave_request = open_request.call_args_list[1].args[0]
+        self.assertEqual(leave_request.get_method(), "DELETE")
+        self.assertTrue(leave_request.full_url.endswith("/v1/voice"))
         self.assertTrue(result["ok"])
 
     def test_http_error_is_structured_and_token_is_redacted(self) -> None:
@@ -170,6 +213,18 @@ class ClientBridgeTests(unittest.TestCase):
                     vlc_pid=4321,
                     vlc_executable="vlc.exe",
                 )
+
+    def test_success_response_requires_explicit_ok_true(self) -> None:
+        bridge = configured_client()
+        response = FakeResponse(200, {"data": {}})
+        with patch.object(client_bridge, "urlopen", return_value=response):
+            with self.assertRaises(client_bridge.ClientBridgeError) as raised:
+                bridge.ensure_session(
+                    guild_id=123456789012345678,
+                    vlc_pid=4321,
+                    vlc_executable="vlc.exe",
+                )
+        self.assertEqual(raised.exception.code, "request_failed")
 
 
 class FakeProcess:
@@ -224,6 +279,31 @@ class SessionSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bridge.calls), 5)
         self.assertEqual(state.client_bridge_confirmed_pid, 100)
 
+    async def test_nonretryable_failure_stops_automatic_setup(self) -> None:
+        bridge = FakeBridge()
+        state = self.make_state(bridge)
+        bridge.ensure_session = unittest.mock.MagicMock(
+            side_effect=client_bridge.ClientBridgeError(
+                "unauthorized",
+                "Bearer authentication is required",
+                retryable=False,
+            )
+        )
+
+        with patch.object(discord_bot.asyncio, "sleep") as sleep:
+            discord_bot.schedule_client_session(state)
+            assert state.client_bridge_task is not None
+            await state.client_bridge_task
+
+        bridge.ensure_session.assert_called_once()
+        sleep.assert_not_called()
+        self.assertIsNone(state.client_bridge_confirmed_pid)
+        self.assertFalse(state.client_bridge_session_enabled)
+
+        discord_bot.schedule_client_session(state)
+        await asyncio.sleep(0)
+        bridge.ensure_session.assert_called_once()
+
     async def test_duplicate_schedule_is_suppressed_after_confirmation(self) -> None:
         bridge = FakeBridge()
         state = self.make_state(bridge)
@@ -261,6 +341,17 @@ class SessionSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bridge.calls), 1)
         self.assertEqual(state.client_bridge_confirmed_pid, 100)
         self.assertTrue(state.client_bridge_session_enabled)
+
+    async def test_failed_force_session_restores_disabled_state(self) -> None:
+        bridge = FakeBridge(failures=1)
+        state = self.make_state(bridge)
+        state.client_bridge_session_enabled = False
+
+        with self.assertRaises(client_bridge.ClientBridgeError):
+            await discord_bot.force_client_session(state)
+
+        self.assertFalse(state.client_bridge_session_enabled)
+        self.assertIsNone(state.client_bridge_target_pid)
 
     async def test_disconnect_clears_confirmation_without_stopping_vlc(self) -> None:
         bridge = FakeBridge()

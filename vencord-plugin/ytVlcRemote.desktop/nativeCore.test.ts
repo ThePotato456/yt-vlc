@@ -99,4 +99,19 @@ describe("native REST boundary", () => {
             retryable: true
         });
     });
+
+    it("does not overlap a later command when an active renderer action times out", async () => {
+        const queue = new SerializedCommandQueue(2, 10);
+        const first = queue.enqueue(command("one", "session.put", { ...voice, stream }));
+        const second = queue.enqueue(command("two", "voice.delete", {}));
+
+        assert.equal((await queue.next(10))?.id, "one");
+        assert.equal((await first).error?.code, "command_timeout");
+        assert.equal(await queue.next(1), null);
+
+        queue.complete("one", success);
+        assert.equal((await queue.next(10))?.id, "two");
+        queue.complete("two", success);
+        assert.equal((await second).status, 200);
+    });
 });

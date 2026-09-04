@@ -26,16 +26,24 @@ function TokenControls() {
     return (
         <div style={{ display: "flex", gap: "8px" }}>
             <Button onClick={async () => {
-                await navigator.clipboard.writeText(settings.store.apiToken);
-                showToast("REST bridge token copied", Toasts.Type.SUCCESS);
+                try {
+                    await navigator.clipboard.writeText(settings.store.apiToken);
+                    showToast("REST bridge token copied", Toasts.Type.SUCCESS);
+                } catch {
+                    showToast("Could not copy the REST bridge token", Toasts.Type.FAILURE);
+                }
             }}>
                 Copy token
             </Button>
-            <Button variant="dangerPrimary" onClick={() => {
+            <Button variant="dangerPrimary" onClick={async () => {
                 const token = generateToken();
-                settings.store.apiToken = token;
-                void Native.rotateToken(token);
-                showToast("REST bridge token regenerated", Toasts.Type.SUCCESS);
+                try {
+                    await Native.rotateToken(token);
+                    settings.store.apiToken = token;
+                    showToast("REST bridge token regenerated", Toasts.Type.SUCCESS);
+                } catch {
+                    showToast("Could not regenerate the REST bridge token", Toasts.Type.FAILURE);
+                }
             }}>
                 Regenerate token
             </Button>

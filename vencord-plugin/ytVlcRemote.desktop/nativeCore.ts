@@ -114,6 +114,7 @@ interface PendingCommand {
     command: BridgeCommand;
     resolve: (result: CommandResult) => void;
     timer: ReturnType<typeof setTimeout>;
+    timedOut: boolean;
 }
 
 export class SerializedCommandQueue {
@@ -134,9 +135,12 @@ export class SerializedCommandQueue {
             const item: PendingCommand = {
                 command,
                 resolve: resolveCommand,
+                timedOut: false,
                 timer: setTimeout(() => {
-                    if (this.active === item) this.active = null;
-                    else this.pending = this.pending.filter(candidate => candidate !== item);
+                    item.timedOut = true;
+                    if (this.active !== item) {
+                        this.pending = this.pending.filter(candidate => candidate !== item);
+                    }
                     resolveCommand(failure(504, "command_timeout", "Discord did not confirm the command in time", true));
                     this.wake();
                 }, this.commandTimeoutMs)
@@ -170,7 +174,7 @@ export class SerializedCommandQueue {
         const item = this.active;
         this.active = null;
         clearTimeout(item.timer);
-        item.resolve(result);
+        if (!item.timedOut) item.resolve(result);
         this.wake();
     }
 
@@ -178,12 +182,12 @@ export class SerializedCommandQueue {
         const result = failure(503, "bridge_stopped", "The Discord client bridge stopped", true);
         if (this.active) {
             clearTimeout(this.active.timer);
-            this.active.resolve(result);
+            if (!this.active.timedOut) this.active.resolve(result);
             this.active = null;
         }
         for (const item of this.pending.splice(0)) {
             clearTimeout(item.timer);
-            item.resolve(result);
+            if (!item.timedOut) item.resolve(result);
         }
         for (const waiter of this.waiters.splice(0)) waiter(null);
     }

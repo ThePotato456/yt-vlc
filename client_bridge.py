@@ -75,6 +75,8 @@ def load_client_bridge_config() -> ClientBridgeConfig | None:
         raise RuntimeError(
             "DISCORD_CLIENT_API_TOKEN and DISCORD_VOICE_CHANNEL_ID must both be set"
         )
+    if not 32 <= len(token) <= 256:
+        raise RuntimeError("DISCORD_CLIENT_API_TOKEN must be 32 to 256 characters")
     try:
         channel_id = int(channel)
     except ValueError as error:
@@ -127,7 +129,12 @@ class ClientBridge:
 
     def disconnect_session(self) -> dict[str, object]:
         """Stop the client stream and leave voice without touching VLC."""
-        self._request("DELETE", "/v1/stream")
+        try:
+            self._request("DELETE", "/v1/stream")
+        except ClientBridgeError:
+            # Leaving voice also terminates an application stream. Still issue
+            # the leave request when explicit stream cleanup could not confirm.
+            pass
         return self._request("DELETE", "/v1/voice")
 
     def _request(
@@ -180,7 +187,7 @@ class ClientBridge:
                 "invalid_response",
                 "Discord client bridge returned an invalid response",
             )
-        if 200 <= status < 300 and result.get("ok") is not False:
+        if 200 <= status < 300 and result.get("ok") is True:
             return result
 
         error_data = result.get("error")
