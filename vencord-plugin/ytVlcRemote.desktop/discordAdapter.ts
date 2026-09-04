@@ -106,7 +106,7 @@ function currentStatus(): Record<string, unknown> {
             channel_id: stream.channelId ?? null,
             source_id: source?.desktopSource?.id ?? null,
             source_pid: metadata?.pid ?? source?.desktopSource?.sourcePid ?? null,
-            source_name: metadata?.sourceName ?? null,
+            source_name: source?.desktopSource ? "VLC media player" : null,
             resolution: source?.quality?.resolution ?? settings.resolution ?? null,
             fps: source?.quality?.frameRate ?? settings.fps ?? null
         } : { active: false }

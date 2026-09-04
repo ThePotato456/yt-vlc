@@ -24,6 +24,11 @@ export function safeBearer(header: string | undefined, token: string): boolean {
     return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
+export function sanitizedWindowName(value: unknown): string {
+    if (typeof value !== "string" || !value.trim()) return "Application window";
+    return value.replace(/https?:\/\/\S+/gi, "[redacted URL]").slice(0, 240);
+}
+
 export function captureSourceHandle(sourceId: string): bigint | null {
     const match = /^window:([^:]+):/.exec(sourceId);
     if (!match) return null;

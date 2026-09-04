@@ -19,6 +19,7 @@ import {
     failure,
     positiveInteger,
     safeBearer,
+    sanitizedWindowName,
     SerializedCommandQueue,
     validatedStreamPayload,
     validateVoicePayload,
@@ -167,7 +168,11 @@ async function captureSources(): Promise<CaptureSourceSummary[]> {
         thumbnailSize: { width: 0, height: 0 },
         fetchWindowIcons: false
     });
-    return sources.map(source => ({ id: source.id, name: source.name, kind: "window" }));
+    return sources.map(source => ({
+        id: source.id,
+        name: sanitizedWindowName(source.name),
+        kind: "window"
+    }));
 }
 
 async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {

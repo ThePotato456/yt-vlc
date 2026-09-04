@@ -12,6 +12,7 @@ import {
     command,
     expectedHost,
     safeBearer,
+    sanitizedWindowName,
     SerializedCommandQueue,
     validatedStreamPayload,
     validateVoicePayload,
@@ -46,6 +47,15 @@ describe("native REST boundary", () => {
         assert.equal(safeBearer("Bearer correct-token", "correct-token"), true);
         assert.equal(safeBearer("Bearer wrong-token", "correct-token"), false);
         assert.equal(safeBearer("Basic correct-token", "correct-token"), false);
+    });
+
+    it("redacts URLs and bounds names returned by source diagnostics", () => {
+        assert.equal(
+            sanitizedWindowName("https://cdn.example/video?token=secret - VLC"),
+            "[redacted URL] - VLC"
+        );
+        assert.equal(sanitizedWindowName(""), "Application window");
+        assert.equal(sanitizedWindowName("x".repeat(300)).length, 240);
     });
 
     it("matches window handles without accepting display sources", () => {
