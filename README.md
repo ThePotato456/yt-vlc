@@ -317,8 +317,13 @@ Never commit `.env`. It is excluded by `.gitignore`.
 
 | Command | Behavior |
 |---|---|
+| `!help` | Open requester-scoped paginated help with playback, session, and configuration pages |
+| `!config` | Owner-only: show the current non-secret live configuration |
+| `!config live <key> <value>` | Owner-only: change a supported setting until the bot restarts |
+| `!config save <key> <value>` | Owner-only: change a supported setting now and persist it to `.env` |
 | `!connect`, `!join`, `!reconnect` | Owner-only: join the configured voice channel and share the bot-owned VLC window |
 | `!disconnect`, `!leave` | Owner-only: stop sharing and leave voice without closing VLC |
+| `!close`, `!shutdown` | Owner-only: stop the Canary stream, leave voice, close every bot-owned VLC process, and shut down the Python bot |
 | `!play <URL> [URL ...]`, `!p <URL> [URL ...]` | Queue one or more URLs in the provided order |
 | `!local`, `!localqueue`, `!media` | Browse and queue files beneath `./media` |
 | `!pause` | Pause the active VLC item |
@@ -328,6 +333,25 @@ Never commit `.env`. It is excluded by `.gitignore`.
 | `!stop` | Stop playback and clear pending bot requests without closing VLC |
 | `!clear`, `!clearplaylist` | Clear VLC's playlist and all pending requests without closing VLC |
 | `!queue`, `!q` | Show pending requests and VLC's live playlist |
+
+The configuration command accepts `guild_id`, `request_channel_id`,
+`voice_channel_id`, `log_level`, `vlc_audio_output`, and `vlc_audio_device`.
+Use `none` to clear an optional setting:
+
+```text
+!config live voice_channel_id 234567890123456789
+!config save request_channel_id 345678901234567890
+!config save vlc_audio_device none
+```
+
+Guild and request-channel routing and the log level take effect immediately.
+A changed voice channel is used by the next `!connect`. Audio output and device
+changes apply the next time VLC starts. Bot tokens, client bridge tokens, and
+the bridge URL cannot be viewed or changed through Discord. `!config` remains
+owner-only in both guild channels and DMs so an accidental routing setting can
+still be repaired. Clearing `voice_channel_id` stops future bridge setup but
+does not tear down an active stream; `!disconnect` remains available for that
+last session.
 
 Seek values accept seconds, `MM:SS`, or `HH:MM:SS`:
 

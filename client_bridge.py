@@ -32,7 +32,7 @@ class ClientBridgeConfig:
     voice_channel_id: int
 
 
-def _validated_api_url(value: str) -> str:
+def validated_api_url(value: str) -> str:
     parsed = urlparse(value)
     try:
         port = parsed.port
@@ -84,7 +84,7 @@ def load_client_bridge_config() -> ClientBridgeConfig | None:
     if channel_id <= 0 or str(channel_id) != channel:
         raise RuntimeError("DISCORD_VOICE_CHANNEL_ID must be a Discord snowflake")
     return ClientBridgeConfig(
-        api_url=_validated_api_url(api_url or DEFAULT_API_URL),
+        api_url=validated_api_url(api_url or DEFAULT_API_URL),
         token=token,
         voice_channel_id=channel_id,
     )

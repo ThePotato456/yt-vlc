@@ -54,6 +54,16 @@ DEFAULT_VLC_AUDIO_OUTPUT = "mmdevice"
 VLC_AUDIO_OUTPUTS = {"automatic", "directsound", "mmdevice", "waveout"}
 QUEUE_PREFETCH_SECONDS = 8.0
 CLIENT_BRIDGE_RETRY_DELAYS = (1.0, 2.0, 5.0, 10.0, 30.0)
+CONFIGURABLE_ENV_KEYS = {
+    "guild_id": "DISCORD_GUILD_ID",
+    "request_channel_id": "DISCORD_REQUEST_CHANNEL_ID",
+    "voice_channel_id": "DISCORD_VOICE_CHANNEL_ID",
+    "log_level": "DISCORD_LOG_LEVEL",
+    "vlc_audio_output": "VLC_AUDIO_OUTPUT",
+    "vlc_audio_device": "VLC_AUDIO_DEVICE",
+}
+CONFIG_NONE_VALUES = {"none", "null", "unset", "off", "-"}
+LOG_LEVEL_NAMES = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 LOCAL_BROWSER_PAGE_SIZE = 20
 LOCAL_MEDIA_EXTENSIONS = {
     ".3gp",
@@ -625,6 +635,27 @@ class VLCSession:
         LOGGER.info("Clearing VLC playlist; player process remains open")
         return self._request({"command": "pl_empty"})
 
+    def close(self) -> bool:
+        """Terminate the bot-owned VLC process, escalating to kill if needed."""
+        with self._start_lock:
+            process = self.process
+            self.process = None
+            if process is None or process.poll() is not None:
+                return False
+            LOGGER.info("Closing bot-owned VLC process pid=%s", process.pid)
+            process.terminate()
+            try:
+                process.wait(timeout=VLC_SHUTDOWN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                LOGGER.warning(
+                    "VLC did not close within %.0fs; killing pid=%s",
+                    VLC_SHUTDOWN_TIMEOUT,
+                    process.pid,
+                )
+                process.kill()
+                process.wait(timeout=VLC_SHUTDOWN_TIMEOUT)
+            return True
+
     def _seek_when_ready(
         self,
         seconds: float,
@@ -758,6 +789,73 @@ class GuildState:
     client_bridge_target_pid: int | None = None
     client_bridge_confirmed_pid: int | None = None
     client_bridge_session_enabled: bool = True
+
+
+@dataclass(slots=True)
+class RuntimeBotConfig:
+    guild_id: int | None
+    request_channel_id: int | None
+    client_api: client_bridge.ClientBridge | None
+
+
+class PaginatedEmbedView(discord.ui.View):
+    """Requester-scoped previous/next controls for a fixed embed sequence."""
+
+    def __init__(self, requester_id: int, pages: Sequence[discord.Embed]) -> None:
+        super().__init__(timeout=180)
+        if not pages:
+            raise ValueError("Paginated embeds require at least one page")
+        self.requester_id = requester_id
+        self.pages = list(pages)
+        self.page_index = 0
+        self.message: discord.Message | None = None
+        self.refresh()
+
+    @property
+    def embed(self) -> discord.Embed:
+        return self.pages[self.page_index]
+
+    def refresh(self) -> None:
+        self.previous.disabled = self.page_index == 0
+        self.next.disabled = self.page_index == len(self.pages) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user is not None and interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "Only the user who opened this help menu can change its page.",
+            ephemeral=True,
+        )
+        return False
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️")
+    async def previous(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        self.page_index = max(0, self.page_index - 1)
+        self.refresh()
+        await interaction.response.edit_message(embed=self.embed, view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, emoji="▶️")
+    async def next(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        self.page_index = min(len(self.pages) - 1, self.page_index + 1)
+        self.refresh()
+        await interaction.response.edit_message(embed=self.embed, view=self)
 
 
 class CookieRetryView(discord.ui.View):
@@ -941,6 +1039,182 @@ def load_env_file(path: Path) -> None:
             os.environ.setdefault(key, value)
 
 
+def write_env_setting(path: Path, key: str, value: str | None) -> None:
+    """Atomically update one allowed setting while preserving the rest of .env."""
+    if key not in CONFIGURABLE_ENV_KEYS.values():
+        raise ValueError("That setting cannot be changed through Discord")
+    if value is not None and ("\r" in value or "\n" in value):
+        raise ValueError("Configuration values cannot contain newlines")
+
+    lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    updated: list[str] = []
+    replaced = False
+    for line in lines:
+        if not pattern.match(line):
+            updated.append(line)
+            continue
+        if value is not None and not replaced:
+            updated.append(f"{key}={value}")
+            replaced = True
+    if value is not None and not replaced:
+        if updated and updated[-1]:
+            updated.append("")
+        updated.append(f"{key}={value}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("\n".join(updated))
+            if updated:
+                handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def normalized_config_key(value: str) -> str:
+    key = value.strip().lower().replace("-", "_")
+    aliases = {
+        "guild": "guild_id",
+        "request_channel": "request_channel_id",
+        "voice_channel": "voice_channel_id",
+        "audio_output": "vlc_audio_output",
+        "audio_device": "vlc_audio_device",
+    }
+    key = aliases.get(key, key)
+    if key not in CONFIGURABLE_ENV_KEYS:
+        choices = ", ".join(sorted(CONFIGURABLE_ENV_KEYS))
+        raise ValueError(f"Unknown setting. Choose one of: {choices}")
+    return key
+
+
+def config_snowflake(value: str, field: str) -> int | None:
+    raw = value.strip()
+    if raw.lower() in CONFIG_NONE_VALUES:
+        return None
+    channel_mention = re.fullmatch(r"<#(\d+)>", raw)
+    if channel_mention:
+        raw = channel_mention.group(1)
+    if not raw.isascii() or not raw.isdigit() or int(raw) <= 0:
+        raise ValueError(f"{field} must be a numeric Discord ID or `none`")
+    return int(raw)
+
+
+def help_embeds() -> list[discord.Embed]:
+    pages = [
+        discord.Embed(
+            title="yt-vlc help",
+            description=(
+                "Queue network or local media in VLC and optionally control the "
+                "logged-in Discord Canary voice session. Use the buttons below "
+                "to browse command groups."
+            ),
+            color=discord.Color.blurple(),
+        ),
+        discord.Embed(
+            title="Playback and queue",
+            color=discord.Color.blurple(),
+        ),
+        discord.Embed(
+            title="Canary session",
+            color=discord.Color.blurple(),
+        ),
+        discord.Embed(
+            title="Configuration",
+            color=discord.Color.blurple(),
+        ),
+    ]
+    pages[0].add_field(
+        name="Quick start",
+        value=(
+            f"`{COMMAND_PREFIX}play <URL> [URL ...]` — queue network media\n"
+            f"`{COMMAND_PREFIX}local` — browse `./media`\n"
+            f"`{COMMAND_PREFIX}queue` — show the combined queue\n"
+            f"`{COMMAND_PREFIX}help` — reopen this menu"
+        ),
+        inline=False,
+    )
+    pages[0].add_field(
+        name="Aliases",
+        value="Common aliases are shown on their command-group pages.",
+        inline=False,
+    )
+    pages[1].add_field(
+        name="Queue media",
+        value=(
+            f"`{COMMAND_PREFIX}play` / `{COMMAND_PREFIX}p` / "
+            f"`{COMMAND_PREFIX}request` — queue up to 25 URLs\n"
+            f"`{COMMAND_PREFIX}local` / `{COMMAND_PREFIX}media` / "
+            f"`{COMMAND_PREFIX}localqueue` — browse local media\n"
+            f"`{COMMAND_PREFIX}queue` / `{COMMAND_PREFIX}q` — inspect requests "
+            "and VLC's playlist"
+        ),
+        inline=False,
+    )
+    pages[1].add_field(
+        name="Playback controls",
+        value=(
+            f"`{COMMAND_PREFIX}pause` and `{COMMAND_PREFIX}resume`\n"
+            f"`{COMMAND_PREFIX}seek <position>` — absolute or relative time\n"
+            f"`{COMMAND_PREFIX}skip` / `{COMMAND_PREFIX}next` / "
+            f"`{COMMAND_PREFIX}s`\n"
+            f"`{COMMAND_PREFIX}stop` — stop playback and clear bot requests\n"
+            f"`{COMMAND_PREFIX}clear` / `clearplaylist` — clear every playlist item"
+        ),
+        inline=False,
+    )
+    pages[2].add_field(
+        name="Owner-only controls",
+        value=(
+            f"`{COMMAND_PREFIX}connect` / `{COMMAND_PREFIX}join` / "
+            f"`{COMMAND_PREFIX}reconnect` — join voice and "
+            "share the bot-owned VLC window\n"
+            f"`{COMMAND_PREFIX}disconnect` / `{COMMAND_PREFIX}leave` — stop "
+            "sharing and leave voice\n"
+            f"`{COMMAND_PREFIX}close` — leave voice, close VLC, and shut down the bot"
+        ),
+        inline=False,
+    )
+    pages[2].add_field(
+        name="Behavior",
+        value=(
+            "Canary self-mutes/deafens, waits for voice state to settle, and "
+            "shares only the verified VLC application at 720p/30 FPS with audio."
+        ),
+        inline=False,
+    )
+    pages[3].add_field(
+        name="Owner-only configuration",
+        value=(
+            f"`{COMMAND_PREFIX}config` — show current safe settings\n"
+            f"`{COMMAND_PREFIX}config live <key> <value>` — change this run only\n"
+            f"`{COMMAND_PREFIX}config save <key> <value>` — change this run and `.env`\n"
+            "Use `none` to clear an optional setting. Tokens are intentionally "
+            "not configurable through Discord."
+        ),
+        inline=False,
+    )
+    pages[3].add_field(
+        name="Supported keys",
+        value=(
+            "`guild_id`, `request_channel_id`, `voice_channel_id`, `log_level`, "
+            "`vlc_audio_output`, `vlc_audio_device`"
+        ),
+        inline=False,
+    )
+    for index, page in enumerate(pages, start=1):
+        page.set_footer(text=f"Page {index}/{len(pages)}")
+    return pages
+
+
 def optional_snowflake(name: str) -> int | None:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -952,6 +1226,124 @@ def optional_snowflake(name: str) -> int | None:
     if snowflake <= 0:
         raise RuntimeError(f"{name} must be greater than zero")
     return snowflake
+
+
+def apply_live_config(
+    runtime: RuntimeBotConfig,
+    key: str,
+    value: str,
+) -> tuple[str | None, str]:
+    """Validate and apply one non-secret runtime setting."""
+    env_key = CONFIGURABLE_ENV_KEYS[key]
+    raw = value.strip()
+    if "\r" in raw or "\n" in raw:
+        raise ValueError("Configuration values cannot contain newlines")
+
+    if key in {"guild_id", "request_channel_id", "voice_channel_id"}:
+        parsed = config_snowflake(raw, key)
+        stored = None if parsed is None else str(parsed)
+        if key == "guild_id":
+            runtime.guild_id = parsed
+            note = "Command guild routing updated immediately."
+        elif key == "request_channel_id":
+            runtime.request_channel_id = parsed
+            note = "Request-channel routing updated immediately."
+        elif parsed is None:
+            runtime.client_api = None
+            note = "The Canary bridge is disabled for this run."
+        else:
+            if runtime.client_api is None:
+                token = os.environ.get("DISCORD_CLIENT_API_TOKEN", "").strip()
+                if not 32 <= len(token) <= 256:
+                    raise ValueError(
+                        "Set DISCORD_CLIENT_API_TOKEN in .env before enabling the bridge"
+                    )
+                api_url = client_bridge.validated_api_url(
+                    os.environ.get(
+                        "DISCORD_CLIENT_API_URL",
+                        client_bridge.DEFAULT_API_URL,
+                    ).strip()
+                    or client_bridge.DEFAULT_API_URL
+                )
+                runtime.client_api = client_bridge.ClientBridge(
+                    client_bridge.ClientBridgeConfig(api_url, token, parsed)
+                )
+            else:
+                runtime.client_api.voice_channel_id = parsed
+            note = "The next `!connect` uses the new voice channel."
+    elif key == "log_level":
+        level = "INFO" if raw.lower() in CONFIG_NONE_VALUES else raw.upper()
+        if level not in LOG_LEVEL_NAMES:
+            raise ValueError("log_level must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+        logging.getLogger().setLevel(getattr(logging, level))
+        stored = None if raw.lower() in CONFIG_NONE_VALUES else level
+        note = f"Live log level changed to {level}."
+    elif key == "vlc_audio_output":
+        output = (
+            DEFAULT_VLC_AUDIO_OUTPUT
+            if raw.lower() in CONFIG_NONE_VALUES
+            else raw.lower()
+        )
+        if output not in VLC_AUDIO_OUTPUTS:
+            choices = ", ".join(sorted(VLC_AUDIO_OUTPUTS))
+            raise ValueError(f"vlc_audio_output must be one of: {choices}")
+        stored = None if raw.lower() in CONFIG_NONE_VALUES else output
+        note = "The audio output applies the next time VLC starts."
+    else:
+        stored = None if raw.lower() in CONFIG_NONE_VALUES else raw
+        if stored is not None and not stored:
+            raise ValueError("vlc_audio_device cannot be empty; use `none` to reset it")
+        note = "The audio device applies the next time VLC starts."
+
+    if stored is None:
+        os.environ.pop(env_key, None)
+    else:
+        os.environ[env_key] = stored
+    return stored, note
+
+
+def configuration_embed(runtime: RuntimeBotConfig) -> discord.Embed:
+    """Render current non-secret runtime configuration."""
+    bridge = runtime.client_api
+    embed = discord.Embed(
+        title="yt-vlc configuration",
+        description=(
+            "Values shown here are live. Use `!config live` for a temporary "
+            "change or `!config save` to also update `.env`."
+        ),
+        color=discord.Color.blurple(),
+    )
+    bridge_state = "configured" if bridge else "disabled"
+    token_state = "configured and hidden" if bridge else "not active"
+    embed.add_field(
+        name="Discord routing",
+        value=(
+            f"Guild: `{runtime.guild_id or 'automatic'}`\n"
+            f"Request channel: `{runtime.request_channel_id or 'any allowed'}`\n"
+            f"Voice channel: `{bridge.voice_channel_id if bridge else 'disabled'}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Canary bridge",
+        value=(
+            f"State: `{bridge_state}`\n"
+            f"URL: `{'configured and hidden' if bridge else 'not active'}`\n"
+            f"Token: `{token_state}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Runtime",
+        value=(
+            f"Log level: `{logging.getLevelName(logging.getLogger().level)}`\n"
+            f"VLC audio output: `{os.environ.get('VLC_AUDIO_OUTPUT', DEFAULT_VLC_AUDIO_OUTPUT)}`\n"
+            f"VLC audio device: `{os.environ.get('VLC_AUDIO_DEVICE', yt_vlc.DEFAULT_VLC_AUDIO_DEVICE)}`"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Secrets cannot be viewed or changed through Discord")
+    return embed
 
 
 def validate_media_url(value: str) -> str:
@@ -2128,6 +2520,7 @@ def build_bot(
     configured_guild_id: int | None,
     client_api: client_bridge.ClientBridge | None = None,
 ) -> commands.Bot:
+    runtime = RuntimeBotConfig(configured_guild_id, request_channel_id, client_api)
     intents = discord.Intents.default()
     intents.message_content = True
     bot = commands.Bot(
@@ -2135,25 +2528,27 @@ def build_bot(
         intents=intents,
         allowed_mentions=discord.AllowedMentions.none(),
         description="Send media requests to yt-vlc.",
+        help_command=None,
     )
     vlc_warmup_lock = asyncio.Lock()
+    config_write_lock = asyncio.Lock()
 
     @bot.check
     async def owner_only_dms(ctx: commands.Context[commands.Bot]) -> bool:
         return ctx.guild is not None or await bot.is_owner(ctx.author)
 
     def dm_target_guild_id() -> int | None:
-        if configured_guild_id is not None:
-            return configured_guild_id
+        if runtime.guild_id is not None:
+            return runtime.guild_id
         if len(bot.guilds) == 1:
             return bot.guilds[0].id
         return None
 
     def startup_target_guild_id() -> int | None:
         guild_id = dm_target_guild_id()
-        if guild_id is not None or client_api is None:
+        if guild_id is not None or runtime.client_api is None:
             return guild_id
-        channel = bot.get_channel(client_api.voice_channel_id)
+        channel = bot.get_channel(runtime.client_api.voice_channel_id)
         guild = getattr(channel, "guild", None)
         inferred_id = getattr(guild, "id", None)
         return inferred_id if isinstance(inferred_id, int) else None
@@ -2170,9 +2565,12 @@ def build_bot(
                 )
                 return False
             return True
-        if configured_guild_id is not None and ctx.guild.id != configured_guild_id:
+        if runtime.guild_id is not None and ctx.guild.id != runtime.guild_id:
             return False
-        return request_channel_id is None or ctx.channel.id == request_channel_id
+        return (
+            runtime.request_channel_id is None
+            or ctx.channel.id == runtime.request_channel_id
+        )
 
     def target_guild_id(ctx: commands.Context[commands.Bot]) -> int:
         guild_id = ctx.guild.id if ctx.guild is not None else dm_target_guild_id()
@@ -2184,10 +2582,12 @@ def build_bot(
     async def on_ready() -> None:
         assert bot.user is not None
         guild_note = (
-            f"guild {configured_guild_id}" if configured_guild_id else "visible guilds"
+            f"guild {runtime.guild_id}" if runtime.guild_id else "visible guilds"
         )
         channel_note = (
-            f"channel {request_channel_id}" if request_channel_id else "all visible channels"
+            f"channel {runtime.request_channel_id}"
+            if runtime.request_channel_id
+            else "all visible channels"
         )
         LOGGER.info(
             "Discord bot ready as %s (%s, %s)",
@@ -2210,7 +2610,7 @@ def build_bot(
             return
         async with vlc_warmup_lock:
             state = get_guild_state(warmup_guild_id)
-            state.client_bridge = client_api
+            state.client_bridge = runtime.client_api
             try:
                 await warm_up_vlc(state)
                 schedule_client_session(state)
@@ -2221,19 +2621,126 @@ def build_bot(
                     warmup_guild_id,
                 )
 
+    @bot.command(name="help")
+    async def help_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Show requester-scoped, paginated command help."""
+        if not await allowed_context(ctx):
+            return
+        view = PaginatedEmbedView(ctx.author.id, help_embeds())
+        view.message = await ctx.reply(
+            embed=view.embed,
+            view=view,
+            mention_author=False,
+        )
+
+    @bot.command(name="config", aliases=["settings"])
+    async def config_command(
+        ctx: commands.Context[commands.Bot],
+        action: str = "show",
+        key: str | None = None,
+        *,
+        value: str = "",
+    ) -> None:
+        """View or change safe live and persistent bot configuration."""
+        if not await bot.is_owner(ctx.author):
+            return
+
+        mode = action.strip().lower()
+        if mode in {"show", "list", "current"} and key is None and not value:
+            await ctx.reply(
+                embed=configuration_embed(runtime),
+                mention_author=False,
+            )
+            return
+        if mode not in {"live", "save"}:
+            await ctx.reply(
+                f"Use `{COMMAND_PREFIX}config`, "
+                f"`{COMMAND_PREFIX}config live <key> <value>`, or "
+                f"`{COMMAND_PREFIX}config save <key> <value>`.",
+                mention_author=False,
+            )
+            return
+        if key is None or not value.strip():
+            await ctx.reply(
+                f"Use `{COMMAND_PREFIX}config {mode} <key> <value>`. "
+                "Use `none` to clear an optional value.",
+                mention_author=False,
+            )
+            return
+
+        try:
+            normalized_key = normalized_config_key(key)
+            stored_value, note = apply_live_config(runtime, normalized_key, value)
+        except (RuntimeError, ValueError) as error:
+            LOGGER.warning(
+                "Rejected Discord configuration change mode=%s key=%s",
+                mode,
+                key[:64],
+            )
+            await ctx.reply(
+                f"Configuration rejected: {str(error)[:MAX_DISCORD_TEXT]}",
+                mention_author=False,
+            )
+            return
+
+        if normalized_key == "voice_channel_id":
+            states = list(GUILD_STATE.values())
+            if runtime.client_api is None:
+                for state in states:
+                    await cancel_client_session_task(state)
+            else:
+                for state in states:
+                    state.client_bridge = runtime.client_api
+
+        if mode == "save":
+            try:
+                async with config_write_lock:
+                    await asyncio.to_thread(
+                        write_env_setting,
+                        ENV_FILE,
+                        CONFIGURABLE_ENV_KEYS[normalized_key],
+                        stored_value,
+                    )
+            except OSError:
+                LOGGER.exception(
+                    "Could not persist Discord configuration key=%s",
+                    normalized_key,
+                )
+                await ctx.reply(
+                    "The live setting was applied, but `.env` could not be updated.",
+                    mention_author=False,
+                )
+                return
+
+        LOGGER.info(
+            "Discord configuration changed mode=%s key=%s requester=%s",
+            mode,
+            normalized_key,
+            getattr(ctx.author, "id", "unknown"),
+        )
+        scope = (
+            "Live and permanent configuration updated."
+            if mode == "save"
+            else "Live configuration updated for this run."
+        )
+        await ctx.reply(
+            f"{scope} `{normalized_key}` changed. {note}",
+            mention_author=False,
+        )
+
     @bot.command(name="connect", aliases=["join", "reconnect"])
     async def connect_command(ctx: commands.Context[commands.Bot]) -> None:
         """Explicitly join the configured voice channel and share VLC."""
         if not await bot.is_owner(ctx.author) or not await allowed_context(ctx):
             return
-        if client_api is None:
+        if runtime.client_api is None:
             await ctx.reply(
                 "The Discord client bridge is not configured.",
                 mention_author=False,
             )
             return
         state = get_guild_state(target_guild_id(ctx))
-        state.client_bridge = client_api
+        state.client_bridge = runtime.client_api
         try:
             if active_vlc_process(state) is None:
                 async with vlc_warmup_lock:
@@ -2274,14 +2781,15 @@ def build_bot(
         """Explicitly stop sharing and leave the client voice call."""
         if not await bot.is_owner(ctx.author) or not await allowed_context(ctx):
             return
-        if client_api is None:
+        state = get_guild_state(target_guild_id(ctx))
+        available_bridge = runtime.client_api or state.client_bridge
+        if available_bridge is None:
             await ctx.reply(
                 "The Discord client bridge is not configured.",
                 mention_author=False,
             )
             return
-        state = get_guild_state(target_guild_id(ctx))
-        state.client_bridge = client_api
+        state.client_bridge = available_bridge
         try:
             await disconnect_client_session(state)
         except client_bridge.ClientBridgeError as error:
@@ -2304,6 +2812,111 @@ def build_bot(
             "Discord client stopped sharing and left voice; VLC remains open.",
             mention_author=False,
         )
+
+    @bot.command(name="close", aliases=["shutdown"])
+    async def close_command(ctx: commands.Context[commands.Bot]) -> None:
+        """Close every bot-owned VLC process and shut down this Python bot."""
+        if not await bot.is_owner(ctx.author):
+            return
+
+        await ctx.reply(
+            "Leaving voice, closing bot-owned VLC, and shutting down the bot…",
+            mention_author=False,
+        )
+        states = list(GUILD_STATE.values())
+
+        # Disable and drain automatic setup before issuing the explicit leave.
+        # Discord needs the VLC capture source to remain alive until it has
+        # confirmed that the stream and voice session are gone.
+        for state in states:
+            state.client_bridge_session_enabled = False
+            state.client_bridge_confirmed_pid = None
+            await cancel_client_session_task(state)
+
+        bridges = {
+            id(bridge): bridge
+            for bridge in (
+                runtime.client_api,
+                *(state.client_bridge for state in states),
+            )
+            if bridge is not None
+        }
+        bridge_results = await asyncio.gather(
+            *(
+                asyncio.to_thread(bridge.disconnect_session)
+                for bridge in bridges.values()
+            ),
+            return_exceptions=True,
+        )
+        failed_bridges = [
+            bridge
+            for bridge, result in zip(bridges.values(), bridge_results)
+            if isinstance(result, BaseException)
+        ]
+
+        # With reconnects disabled and Discord detached, stop local playback
+        # work before terminating the VLC processes it may be controlling.
+        playback_tasks: list[asyncio.Task[object]] = []
+        for state in states:
+            state.cancel_current = True
+            if state.prefetch is not None:
+                state.prefetch.task.cancel()
+                playback_tasks.append(state.prefetch.task)
+                state.prefetch = None
+            if state.worker is not None and not state.worker.done():
+                state.worker.cancel()
+                playback_tasks.append(state.worker)
+            state.worker = None
+            for request in drain_pending_requests(state):
+                request.cookie_data = None
+        if playback_tasks:
+            await asyncio.gather(*playback_tasks, return_exceptions=True)
+
+        sessions = {
+            id(state.vlc): state.vlc
+            for state in states
+            if state.vlc is not None
+        }
+        results = await asyncio.gather(
+            *(asyncio.to_thread(session.close) for session in sessions.values()),
+            return_exceptions=True,
+        )
+        failures = sum(isinstance(result, BaseException) for result in results)
+        if failures:
+            LOGGER.error(
+                "Shutdown could not close %s bot-owned VLC process(es)",
+                failures,
+            )
+
+        # A failed first leave may have been caused by Discord still unwinding
+        # the capture source. Retry once after VLC is gone before closing the bot.
+        if failed_bridges:
+            retry_results = await asyncio.gather(
+                *(
+                    asyncio.to_thread(bridge.disconnect_session)
+                    for bridge in failed_bridges
+                ),
+                return_exceptions=True,
+            )
+            failed_bridges = [
+                bridge
+                for bridge, result in zip(failed_bridges, retry_results)
+                if isinstance(result, BaseException)
+            ]
+        if failed_bridges:
+            LOGGER.error(
+                "Shutdown could not confirm %s Discord client disconnect(s)",
+                len(failed_bridges),
+            )
+        LOGGER.info(
+            "Shutdown requested through Discord requester=%s vlc_sessions=%s "
+            "vlc_failures=%s bridge_failures=%s",
+            getattr(ctx.author, "id", "unknown"),
+            len(sessions),
+            failures,
+            len(failed_bridges),
+        )
+        await bot.close()
 
     @bot.command(name="play", aliases=["request", "p"])
     async def play_command(ctx: commands.Context[commands.Bot], *, url: str) -> None:

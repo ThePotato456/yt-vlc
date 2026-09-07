@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import tempfile
 import threading
 import unittest
@@ -840,6 +841,285 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
         bridge.disconnect_session.assert_not_called()
         self.assertEqual(context.replies, [])
 
+    async def test_close_command_closes_vlc_and_the_bot_for_owner(self) -> None:
+        events: list[str] = []
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        bridge = MagicMock()
+        bridge.disconnect_session.side_effect = lambda: events.append("bridge")
+        session = MagicMock()
+        session.close.side_effect = lambda: events.append("vlc") or True
+        state = discord_bot.GuildState(
+            guild_id=123,
+            vlc=session,
+            client_bridge=bridge,
+        )
+        discord_bot.GUILD_STATE[123] = state
+        context = FakeContext()
+
+        try:
+            with (
+                patch.object(bot, "is_owner", new=AsyncMock(return_value=True)),
+                patch.object(
+                    bot,
+                    "close",
+                    new=AsyncMock(side_effect=lambda: events.append("bot")),
+                ) as close_bot,
+            ):
+                await bot.get_command("close").callback(context)  # type: ignore[arg-type, union-attr]
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        bridge.disconnect_session.assert_called_once_with()
+        session.close.assert_called_once_with()
+        close_bot.assert_awaited_once_with()
+        self.assertEqual(events, ["bridge", "vlc", "bot"])
+        self.assertFalse(state.client_bridge_session_enabled)
+        self.assertIn("shutting down", context.replies[-1])
+
+    async def test_close_retries_failed_client_disconnect_after_vlc_closes(self) -> None:
+        events: list[str] = []
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        bridge = MagicMock()
+
+        def disconnect() -> None:
+            events.append("bridge")
+            if events.count("bridge") == 1:
+                raise discord_bot.client_bridge.ClientBridgeError(
+                    "bridge_unavailable",
+                    "Discord client bridge is unavailable",
+                )
+
+        bridge.disconnect_session.side_effect = disconnect
+        session = MagicMock()
+        session.close.side_effect = lambda: events.append("vlc") or True
+        discord_bot.GUILD_STATE[123] = discord_bot.GuildState(
+            guild_id=123,
+            vlc=session,
+            client_bridge=bridge,
+        )
+        context = FakeContext()
+
+        try:
+            with (
+                patch.object(bot, "is_owner", new=AsyncMock(return_value=True)),
+                patch.object(
+                    bot,
+                    "close",
+                    new=AsyncMock(side_effect=lambda: events.append("bot")),
+                ),
+            ):
+                await bot.get_command("close").callback(context)  # type: ignore[arg-type, union-attr]
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        self.assertEqual(events, ["bridge", "vlc", "bridge", "bot"])
+
+    async def test_close_command_is_owner_only(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        session = MagicMock()
+        state = discord_bot.GuildState(guild_id=123, vlc=session)
+        discord_bot.GUILD_STATE[123] = state
+        context = FakeContext()
+
+        try:
+            with (
+                patch.object(bot, "is_owner", new=AsyncMock(return_value=False)),
+                patch.object(bot, "close", new=AsyncMock()) as close_bot,
+            ):
+                await bot.get_command("close").callback(context)  # type: ignore[arg-type, union-attr]
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        session.close.assert_not_called()
+        close_bot.assert_not_awaited()
+        self.assertEqual(context.replies, [])
+
+    async def test_help_command_returns_requester_scoped_paginated_embed(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        context = FakeContext()
+
+        command = bot.get_command("help")
+        self.assertIsNotNone(command)
+        await command.callback(context)  # type: ignore[arg-type, union-attr]
+
+        embed = context.reply_options[-1]["embed"]
+        view = context.reply_options[-1]["view"]
+        self.assertIsInstance(embed, discord.Embed)
+        self.assertIsInstance(view, discord_bot.PaginatedEmbedView)
+        self.assertEqual(len(view.pages), 4)
+        self.assertEqual(view.requester_id, context.author.id)
+        self.assertTrue(view.previous.disabled)
+        self.assertFalse(view.next.disabled)
+        self.assertIs(view.message, context.response_message)
+
+    async def test_config_command_changes_live_routing_without_writing_env(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        context = FakeContext()
+        command = bot.get_command("config")
+        self.assertIsNotNone(command)
+
+        with (
+            patch.object(bot, "is_owner", new=AsyncMock(return_value=True)),
+            patch.object(discord_bot, "write_env_setting") as write_setting,
+        ):
+            await command.callback(  # type: ignore[arg-type, union-attr]
+                context,
+                "live",
+                "request_channel_id",
+                value="987654321",
+            )
+
+        write_setting.assert_not_called()
+        self.assertIn("Live configuration updated", context.replies[-1])
+        self.assertIn("request_channel_id", context.replies[-1])
+
+        allowed_context = FakeContext()
+        allowed_context.channel = SimpleNamespace(id=987654321)  # type: ignore[assignment]
+        await bot.get_command("help").callback(allowed_context)  # type: ignore[arg-type, union-attr]
+        self.assertEqual(len(allowed_context.reply_options), 1)
+
+        blocked_context = FakeContext()
+        await bot.get_command("help").callback(blocked_context)  # type: ignore[arg-type, union-attr]
+        self.assertEqual(blocked_context.reply_options, [])
+
+    async def test_config_save_updates_env_file_and_live_log_level(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        context = FakeContext()
+        command = bot.get_command("config")
+        self.assertIsNotNone(command)
+        previous_level = logging.getLogger().level
+
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                env_file = Path(temporary) / ".env"
+                env_file.write_text(
+                    "DISCORD_BOT_TOKEN=secret\n# keep me\n",
+                    encoding="utf-8",
+                )
+                with (
+                    patch.object(bot, "is_owner", new=AsyncMock(return_value=True)),
+                    patch.object(discord_bot, "ENV_FILE", env_file),
+                    patch.dict(os.environ, {}, clear=False),
+                ):
+                    await command.callback(  # type: ignore[arg-type, union-attr]
+                        context,
+                        "save",
+                        "log_level",
+                        value="warning",
+                    )
+
+                contents = env_file.read_text(encoding="utf-8")
+        finally:
+            logging.getLogger().setLevel(previous_level)
+
+        self.assertIn("DISCORD_BOT_TOKEN=secret", contents)
+        self.assertIn("# keep me", contents)
+        self.assertIn("DISCORD_LOG_LEVEL=WARNING", contents)
+        self.assertIn("Live and permanent configuration updated", context.replies[-1])
+
+    async def test_config_command_is_owner_only_and_rejects_secret_keys(self) -> None:
+        bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=123)
+        command = bot.get_command("config")
+        self.assertIsNotNone(command)
+
+        other_context = FakeContext()
+        with patch.object(bot, "is_owner", new=AsyncMock(return_value=False)):
+            await command.callback(other_context)  # type: ignore[arg-type, union-attr]
+        self.assertEqual(other_context.replies, [])
+
+        owner_context = FakeContext()
+        with patch.object(bot, "is_owner", new=AsyncMock(return_value=True)):
+            await command.callback(  # type: ignore[arg-type, union-attr]
+                owner_context,
+                "live",
+                "discord_bot_token",
+                value="should-never-be-echoed",
+            )
+        self.assertIn("Configuration rejected", owner_context.replies[-1])
+        self.assertNotIn("should-never-be-echoed", owner_context.replies[-1])
+
+    async def test_clearing_voice_config_retains_explicit_disconnect(self) -> None:
+        bridge = MagicMock()
+        bridge.disconnect_session.return_value = {"ok": True}
+        bot = discord_bot.build_bot(
+            request_channel_id=None,
+            configured_guild_id=123,
+            client_api=bridge,
+        )
+        state = discord_bot.GuildState(guild_id=123, client_bridge=bridge)
+        discord_bot.GUILD_STATE[123] = state
+        context = FakeContext()
+
+        try:
+            with patch.object(bot, "is_owner", new=AsyncMock(return_value=True)):
+                await bot.get_command("config").callback(  # type: ignore[arg-type, union-attr]
+                    context,
+                    "live",
+                    "voice_channel_id",
+                    value="none",
+                )
+                await bot.get_command("disconnect").callback(context)  # type: ignore[arg-type, union-attr]
+        finally:
+            discord_bot.GUILD_STATE.pop(123, None)
+
+        bridge.disconnect_session.assert_called_once_with()
+        self.assertIn("left voice", context.replies[-1])
+
+    def test_configuration_embed_hides_bridge_endpoint_and_token(self) -> None:
+        secret = "super-secret-client-token-value-123456"
+        endpoint = "http://127.0.0.1:38423"
+        bridge = discord_bot.client_bridge.ClientBridge(
+            discord_bot.client_bridge.ClientBridgeConfig(
+                endpoint,
+                secret,
+                987654321,
+            )
+        )
+        embed = discord_bot.configuration_embed(
+            discord_bot.RuntimeBotConfig(123, 456, bridge)
+        )
+        rendered = str(embed.to_dict())
+
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn(endpoint, rendered)
+        self.assertIn("configured and hidden", rendered)
+
+    def test_write_env_setting_replaces_duplicates_and_can_clear_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            env_file = Path(temporary) / ".env"
+            env_file.write_text(
+                "# existing\nDISCORD_GUILD_ID=1\nKEEP=this\nDISCORD_GUILD_ID=2\n",
+                encoding="utf-8",
+            )
+
+            discord_bot.write_env_setting(env_file, "DISCORD_GUILD_ID", "123")
+            updated = env_file.read_text(encoding="utf-8")
+            self.assertEqual(updated.count("DISCORD_GUILD_ID="), 1)
+            self.assertIn("DISCORD_GUILD_ID=123", updated)
+            self.assertIn("KEEP=this", updated)
+            self.assertIn("# existing", updated)
+
+            discord_bot.write_env_setting(env_file, "DISCORD_GUILD_ID", None)
+            cleared = env_file.read_text(encoding="utf-8")
+            self.assertNotIn("DISCORD_GUILD_ID=", cleared)
+            self.assertIn("KEEP=this", cleared)
+
+    def test_write_env_setting_rejects_secrets_and_newlines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            env_file = Path(temporary) / ".env"
+            with self.assertRaisesRegex(ValueError, "cannot be changed"):
+                discord_bot.write_env_setting(
+                    env_file,
+                    "DISCORD_CLIENT_API_TOKEN",
+                    "secret",
+                )
+            with self.assertRaisesRegex(ValueError, "newlines"):
+                discord_bot.write_env_setting(
+                    env_file,
+                    "VLC_AUDIO_DEVICE",
+                    "first\nsecond",
+                )
+
     async def test_owner_dm_automatically_targets_the_only_guild(self) -> None:
         bot = discord_bot.build_bot(request_channel_id=None, configured_guild_id=None)
         command = bot.get_command("queue")
@@ -1210,6 +1490,30 @@ class GuildQueueTests(unittest.IsolatedAsyncioTestCase):
         )
         second_process.terminate.assert_not_called()
         self.assertIs(session.process, second_process)
+
+    def test_vlc_close_terminates_and_kills_after_timeout(self) -> None:
+        process = MagicMock()
+        process.pid = 4321
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            discord_bot.subprocess.TimeoutExpired("vlc.exe", 5),
+            0,
+        ]
+        session = discord_bot.VLCSession("vlc.exe")
+        session.process = process
+
+        self.assertTrue(session.close())
+
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(
+            process.wait.call_args_list,
+            [
+                call(timeout=discord_bot.VLC_SHUTDOWN_TIMEOUT),
+                call(timeout=discord_bot.VLC_SHUTDOWN_TIMEOUT),
+            ],
+        )
+        self.assertIsNone(session.process)
 
     def test_separate_audio_is_sent_as_an_input_slave(self) -> None:
         session = discord_bot.VLCSession("vlc.exe")
